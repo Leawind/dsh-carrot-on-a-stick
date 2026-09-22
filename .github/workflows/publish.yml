@@ -1,0 +1,31 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      # 推 tag 发布时，tag 必须与 package.json 版本一致，防止发错版本
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          node -e "const v=require('./package.json').version; const t=process.env.GITHUB_REF_NAME.slice(1); if(v!==t){console.error('tag v'+t+' != package.json '+v);process.exit(1)}; console.log('publishing', v)"
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
