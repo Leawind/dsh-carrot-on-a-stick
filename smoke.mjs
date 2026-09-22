@@ -61,8 +61,21 @@ function makeAgent(id, cwd) {
 const liveAgent = makeAgent('sess-live', FAKE_CWD)
 const liveSession2 = { id: 'sess-live2', header: { version: 0, id: 'sess-live2', createdAt: 1, cwd: FAKE_CWD } }
 
+// 失败路径: 只产出 turn/end{reason: error} 的 live 会话(模型调用失败的样子)
+const errAgent = (() => {
+  const events = []
+  return {
+    session: { id: 'sess-err', header: { version: 0, id: 'sess-err', createdAt: 1, cwd: FAKE_CWD }, snapshotEvents: (from = 0) => events.slice(from) },
+    followup: (message) => {
+      events.push({ type: 'user/message', data: { message } })
+      events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { code: 'AUTH', message: 'invalid api key' } } } })
+    },
+    whenIdle: async () => {},
+  }
+})()
+
 const fakeSessions = {
-  get: (id) => (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : undefined),
+  get: (id) => (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : id === 'sess-err' ? errAgent.session : undefined),
   list: () => [liveSession2],
   flush: async (session) => { flushed.push(session.id); return true },
 }
@@ -86,18 +99,18 @@ const ctx = {
   tools: fakeTools,
   llm: {},
   agents: {
-    get: (id) => (id === 'sess-live' ? liveAgent : undefined),
-    create: async ({ sessionId, meta, setup }) => {
+    get: (id) => (id === 'sess-live' ? liveAgent : id === 'sess-err' ? errAgent : undefined),
+    create: async ({ sessionId, meta, agentOptions, setup }) => {
       const id = String(sessionId)
-      created.push({ id, cwd: meta?.cwd })
+      created.push({ id, cwd: meta?.cwd, agentOptions })
       const agent = makeAgent(id, meta?.cwd)
       if (setup) await setup({}, agent)
       return { agent, dispose: async () => { disposed.push(id) } }
     },
-    resume: async ({ resumeSessionId, setup }) => {
+    resume: async ({ resumeSessionId, agentOptions, setup }) => {
       const id = String(resumeSessionId)
       if (id !== 'sess-persisted') throw new Error(`no persisted session "${id}"`)
-      resumed.push(id)
+      resumed.push({ id, agentOptions })
       const agent = makeAgent(id, FAKE_CWD)
       if (setup) await setup({}, agent)
       return { agent, dispose: async () => { disposed.push(id) } }
@@ -112,7 +125,8 @@ const ctx = {
     : name === 'sessions' ? fakeSessions
       : name === 'sessionPersistence' ? fakePersistence
         : name === 'tools' ? fakeTools
-          : undefined),
+          : name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'p1', model: 'm1' }) }
+            : undefined),
 }
 
 const PORT = 8099
@@ -167,8 +181,8 @@ function innerOf(resp) {
 
 const checks = {}
 try {
-  // ── Phase B(主流程): 无认证、无白名单, 端口 8099 ──
-  await apply(ctx, { port: PORT, host: '127.0.0.1' })
+  // ── Phase B(主流程): 无认证、无白名单, 端口 8099; 存量捞回显式开启 ──
+  await apply(ctx, { port: PORT, host: '127.0.0.1', reattachOrphans: true })
   await new Promise((r) => setTimeout(r, 400))
 
   const init = await rpc(undefined, {
@@ -212,10 +226,17 @@ try {
   const runPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-persisted' } } })
   const runPersistedInner = runPersisted.status === 200 ? innerOf(runPersisted) : { error: 'bad' }
   checks['agent_run 持久化会话 resume + flush + dispose'] = runPersistedInner.sessionId === 'sess-persisted'
-    && resumed.includes('sess-persisted') && flushed.includes('sess-persisted') && disposed.includes('sess-persisted')
+    && resumed.some((r) => r.id === 'sess-persisted') && flushed.includes('sess-persisted') && disposed.includes('sess-persisted')
+  checks['resume 也带完整模型选择(agentDefaultModel 补全)'] = resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.provider === 'p1'
+    && resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.model === 'm1'
 
   const runUnknown = await rpc(init.sid, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-unknown' } } })
   checks['agent_run 未知会话明确报错'] = runUnknown.status === 200 && String(innerOf(runUnknown).error ?? '').includes('session not found for resume')
+
+  // 失败透出: turn/end error 进 result.error(E2E 发现的静默空结果缺陷)
+  const runErr = await rpc(init.sid, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'boom', sessionId: 'sess-err' } } })
+  const runErrInner = runErr.status === 200 ? innerOf(runErr) : { error: 'bad' }
+  checks['agent_run 失败透出(turn/end error)'] = String(runErrInner.error ?? '').includes('AUTH') && String(runErrInner.error ?? '').includes('invalid api key')
 
   // 事件读取走 snapshotEvents + 结构化解析
   checks['结构化解析(toolCalls/changes/verification)'] = runPersistedInner.toolCalls?.length === 1
@@ -226,6 +247,7 @@ try {
   const runNew = await rpc(init.sid, { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: FAKE_CWD } } })
   const runNewInner = runNew.status === 200 ? innerOf(runNew) : { error: 'bad' }
   checks['agent_run 池新建: meta.cwd 为 realpath 值'] = Boolean(created[0]) && created[0].cwd === FAKE_CWD && runNewInner.sessionId === created[0].id
+  checks['池新建带完整模型选择(agentDefaultModel 补全, {{model}} 变量来源)'] = created[0]?.agentOptions?.provider === 'p1' && created[0]?.agentOptions?.model === 'm1'
 
   const missingDir = resolve(FAKE_CWD, 'nonexistent-xyz')
   const runMissingCwd = await rpc(init.sid, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: missingDir } } })

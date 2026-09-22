@@ -37,9 +37,9 @@ export interface Config {
     http?: boolean;
     port?: number;
     host?: string;
-    /** 后端 provider(默认 deepseek-official) */
+    /** 后端 provider(默认空 = 跟随宿主用户设置; 需与 model 成对配置才生效) */
     provider?: string;
-    /** 执行任务的模型(空/缺省 = 跟随 dsh 用户/默认设置) */
+    /** 执行任务的模型(默认空 = 跟随宿主用户设置; 需与 provider 成对配置才生效) */
     model?: string;
     /** 挂载的 agent preset(默认 standard) */
     preset?: string;
@@ -55,6 +55,12 @@ export interface Config {
     workspaceRoots?: string[];
     /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
     allowedHosts?: string[];
+    /**
+     * 启动时存量捞回: 把现存未分组会话补挂到已注册工作区(默认 false)。
+     * 0.1.5+ 的 workspaceRegistry 本身按 header.cwd 自动索引, 该操作只补充手动花名册——
+     * 会对用户数据做批量持久化写入, 仅在明确需要时开启。
+     */
+    reattachOrphans?: boolean;
 }
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 dsh 能力。

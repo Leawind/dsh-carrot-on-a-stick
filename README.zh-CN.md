@@ -41,13 +41,19 @@ dsh agent —— 完整工具集：bash、fs、todo、web…
 
 ## 安装与运行
 
+插件以包形式装进 dsh 的 **profile 目录**（loader 从那里解析插件名；在仓库根直接 `--patch` 是找不到本地包的——见 [E2E 记录](./docs/e2e-0.1.5-rc.2.zh.md) 发现 1）：
+
 ```bash
 git clone https://github.com/Leawind/dsh-ops-mcp.git
 cd dsh-ops-mcp
-npm install
+npm install && npm run build
+npm pack                                        # 产出 dsh-ops-mcp-<ver>.tgz
 
-export DEEPSEEK_API_KEY=...
-dsh web --patch ./cordis.yml
+# 装进 profile(Windows 注意: 用 tarball, pnpm 对 file:D:/... 形式会拼坏路径)
+pnpm -C ~/.dsh/profiles/<profile> add -w <tarball 路径>
+
+export DEEPSEEK_API_KEY=...                     # 模型凭证(或用 ~/.dsh 里已保存的)
+dsh --profile <profile> --patch ./cordis.yml --no-open --port 3081
 ```
 
 MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指向 `http://127.0.0.1:8090/mcp` 即可。
@@ -103,8 +109,12 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 | `authToken` | — | Bearer token；设置后所有请求强制校验（常数时间比较） |
 | `workspaceRoots` | — | cwd 白名单；agent 只能在列出的目录（含子目录）下干活 |
 | `allowedHosts` | — | Host 头白名单追加项；默认放行绑定地址与 loopback 别名，其余 403 |
-| `provider` / `model` / `preset` | `deepseek-official` / 跟随用户设置 / `standard` | 生成 agent 的配置 |
+| `provider` / `model` | 跟随宿主用户设置（`agentDefaultModel`） | 生成 agent 的模型选择；**需成对配置**，只配一边会用宿主默认补全另一边 |
+| `preset` | `standard` | 挂载的 agent preset |
+| `reattachOrphans` | `false` | 启动时把未分组会话补挂到工作区（批量写用户数据，默认关；`attach_session` 工具随时可用） |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
+
+每个任务结果都是**结构化**的：`sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers / error`——`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果。
 
 ## 零宿主副本
 
@@ -137,14 +147,14 @@ HTTP 入口只服务 `/mcp`，其余路径 404。
 
 ## Roadmap / 已知限制（对 dsh 0.1.5-rc.2）
 
-0.2.0 Roadmap 中的兼容性问题已全部在 **0.3.0** 处理完毕（见 [CHANGELOG](./CHANGELOG.md)）：scopeOf 预检移除、`dsh_list_tools` 改走 `schemas()`、持久化快照 `.header` 兼容、`workspaceRegistry.attachSession` 核对确认仍有效、Windows 白名单分隔符修复、`apply()` 等待 `listen`。
+0.2.0 Roadmap 的兼容性问题已在 0.3.0 处理；**0.3.1 完成真机 E2E 验证**（全绿，见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)），并修复 E2E 发现的问题：`{{model}}` 提示词变量（模型选择现经 `agentDefaultModel` 补全）、turn 失败透出、池会话 flush、存量捞回默认关闭、安装流程文档修正。
 
 仍然存在的限制：
 
 - [ ] 任务队列在进程内存中，进程重启丢失（后续可持久化）。
-- [ ] `agent_run` / `task_inbox` 无服务端超时与取消；调用方需自带 MCP 层超时。
-- [ ] spawn 出的会话里工具调用走宿主 approval 策略（ask 策略下会弹窗或 fail-closed）。
-- [ ] 尚未在真实 `dsh web --patch` 环境做端到端验证（当前以宿主接口核对 + 假 ctx 冒烟为准）。
+- [ ] `agent_run` / `task_inbox` 无服务端超时与取消——卡死的 agent 会占住该 cwd 的串行锁，后续同目录任务排队等待；调用方需自带 MCP 层超时。
+- [ ] spawn 出的会话里工具调用走宿主 approval 策略（`ask` 下敏感操作可能弹窗或 fail-closed；本次 E2E 的只读操作未受影响）。
+- [ ] `dsh_list_tools` 只列宿主全局注册表；按 agent 作用域列出实际可用工具需要宿主侧 API（ScopeKey 私有符号，零副本原则下拿不到）。
 - [ ] dsh 未来版本升级时，devDeps 里的 `@deepseek-ai/*` 类型版本需同步（仅影响编译期，运行时零依赖不受影响）。
 
 ## 开发
@@ -152,9 +162,10 @@ HTTP 入口只服务 `/mcp`，其余路径 404。
 ```bash
 npm install
 npm run build    # 独立构建(纯 tsc), 产出 lib/
-npm run smoke    # 端口 8099/8098 上的冒烟测试(假 ctx + 真实 MCP 协议往返, 24 项)
-                 # + 端口冲突专项(apply 必须显式失败)
+npm run smoke    # 端口 8099/8098 假 ctx 冒烟(27 项, 真实 MCP 协议往返) + 端口冲突专项
 ```
+
+真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md) 的方式起一个独立 profile，然后 `E2E_WITH_AGENT=1 node e2e.mjs`。
 
 ## License
 

@@ -44,7 +44,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.3.0'
+const PLUGIN_VERSION = '0.3.1'
 
 /**
  * 声明依赖的核心服务。
@@ -59,9 +59,9 @@ export interface Config {
   http?: boolean
   port?: number
   host?: string
-  /** 后端 provider(默认 deepseek-official) */
+  /** 后端 provider(默认空 = 跟随宿主用户设置; 需与 model 成对配置才生效) */
   provider?: string
-  /** 执行任务的模型(空/缺省 = 跟随 dsh 用户/默认设置) */
+  /** 执行任务的模型(默认空 = 跟随宿主用户设置; 需与 provider 成对配置才生效) */
   model?: string
   /** 挂载的 agent preset(默认 standard) */
   preset?: string
@@ -77,12 +77,19 @@ export interface Config {
   workspaceRoots?: string[]
   /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
   allowedHosts?: string[]
+  /**
+   * 启动时存量捞回: 把现存未分组会话补挂到已注册工作区(默认 false)。
+   * 0.1.5+ 的 workspaceRegistry 本身按 header.cwd 自动索引, 该操作只补充手动花名册——
+   * 会对用户数据做批量持久化写入, 仅在明确需要时开启。
+   */
+  reattachOrphans?: boolean
 }
 
 /** 运行时配置默认值 */
 const DEFAULTS = {
-  provider: 'deepseek-official',
-  // 空字符串 = 不覆盖 model, 跟随 dsh 的用户/默认设置; 显式配置则覆盖
+  // provider/model 默认空 = 完全跟随宿主用户设置(官方 session.create 同款)。
+  // E2E 教训: 只传 provider 不传 model 会让 persona 提示词的 {{model}} 变量无值, 整个 turn 在组装期失败。
+  provider: '',
   model: '',
   preset: 'standard',
   maxQueue: 100,
@@ -234,6 +241,29 @@ async function mountPreset(ctx: Context, agentCtx: Context): Promise<void> {
   await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
 }
 
+/**
+ * 解析生成 agent 的模型选择: provider+model 成对显式配置直接用; 部分配置用宿主默认选择
+ * (ctx.agentDefaultModel.currentSelection(), Web UI 建会话同款来源)补全另一边; 仍不完整则明确报错。
+ *
+ * 背景(E2E 实测): agent-loop 把 {{model}} 提示词变量直接读 agent.options.model, 不做任何默认解析——
+ * 默认模型的解析发生在 Web 应用层。插件直连 ctx.agents.create 时必须自带完整选择,
+ * 否则 persona 组装期 "{{model}} has no value" 让整个 turn 失败。
+ */
+function resolveAgentOptions(ctx: Context): { provider: string; model: string } {
+  const { provider, model } = runtimeConfig
+  if (provider && model) return { provider, model }
+  const def = (ctx.get('agentDefaultModel') as {
+    currentSelection?: () => { provider?: string; model?: string } | undefined
+  } | undefined)?.currentSelection?.()
+  const p = provider || def?.provider
+  const m = model || def?.model
+  if (p && m) return { provider: p, model: m }
+  throw new Error(
+    `cannot determine model for spawned agent: plugin config has {provider: ${JSON.stringify(provider || null)}, model: ${JSON.stringify(model || null)}}, host default selection has {provider: ${JSON.stringify(def?.provider ?? null)}, model: ${JSON.stringify(def?.model ?? null)}}. `
+    + '请在插件 config 成对配置 provider+model, 或先在 dsh 设置里选择默认模型.',
+  )
+}
+
 /** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名 */
 async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string): Promise<ResolvedAgent> {
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
@@ -260,13 +290,10 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     // live 也没有: 从持久化会话存储 resume 并接管(进程重启前的会话、LRU 淘汰后被释放的会话)
     let handle: AgentHandle
     try {
+      // 模型选择: 显式成对配置或经宿主默认选择补全(agent.options.model 是 {{model}} 变量的来源)
       handle = await ctx.agents.resume({
         resumeSessionId: sid,
-        agentOptions: {
-          provider: runtimeConfig.provider,
-          // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-          ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-        },
+        agentOptions: resolveAgentOptions(ctx),
         setup: async (agentCtx) => {
           await mountPreset(ctx, agentCtx)
         },
@@ -306,11 +333,8 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     sessionId: newSessionId,
     // 声明 preset: 当前版本主要靠 setup 里 mount, meta.agentPreset 供未来 Harness 版本直接消费。
     meta: { cwd: canonical, agentPreset: runtimeConfig.preset },
-    agentOptions: {
-      provider: runtimeConfig.provider,
-      // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-      ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-    },
+    // 模型选择: 显式成对配置或经宿主默认选择补全(agent.options.model 是 {{model}} 变量的来源)
+    agentOptions: resolveAgentOptions(ctx),
     setup: async (agentCtx) => {
       await mountPreset(ctx, agentCtx)
     },
@@ -363,6 +387,11 @@ interface TaskResult {
   changes: string
   verification: string
   leftovers: string
+  /**
+   * 失败透出: turn/end 的非 completed 收场(LlmError / 取消 / blocked / max-tokens 等)。
+   * E2E 实测教训: 模型调用失败时没有 assistant 输出, 不透出错误的话调用方只拿到一份"成功"的空结果。
+   */
+  error: string
 }
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
@@ -401,6 +430,7 @@ function truncateResult(result: TaskResult): TaskResult {
     assistantText: result.assistantText.slice(0, 8000),
     toolCalls: result.toolCalls.slice(0, 50).map((c) => ({ ...c, args: c.args.slice(0, 2000) })),
     toolResults: result.toolResults.slice(0, 20).map((r) => r.slice(0, 2000)),
+    error: result.error.slice(0, 2000),
   }
 }
 
@@ -437,10 +467,12 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     // 结构化读输出
     const result: TaskResult = {
       taskId: '', sessionId, assistantText: '', toolCalls: [], toolResults: [],
-      changes: '', verification: '', leftovers: '',
+      changes: '', verification: '', leftovers: '', error: '',
     }
+    let observedEvents = 0
     try {
       const events = eventsOf(handle.agent.session).slice(baseline)
+      observedEvents = events.length
       const extractText = (obj: unknown, outTexts: string[]): void => {
         if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, outTexts)); return }
         if (obj && typeof obj === 'object') {
@@ -472,10 +504,30 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
           const texts: string[] = []
           extractText(ev.data ?? ev, texts)
           if (texts.length) result.toolResults.push(texts.join('\n').slice(0, 3000))
+        } else if (ev.type === 'turn/end') {
+          // 失败透出: turn 的非 completed 收场(LlmError/取消/blocked/max-tokens)进 error 字段。
+          // E2E 实测教训: 模型调用失败时没有任何 assistant 输出, 不透出的话调用方只拿到"成功"的空结果。
+          const d = ev.data as {
+            turn?: number
+            reason?: { kind?: string; error?: { message?: string; code?: string }; reason?: unknown }
+          } | undefined
+          const r = d?.reason
+          if (r && r.kind && r.kind !== 'completed') {
+            const bits = [`turn ${d?.turn ?? '?'} ended: ${r.kind}`]
+            if (r.error) bits.push(`${r.error.code ?? 'ERROR'}: ${r.error.message ?? ''}`)
+            else if (r.reason !== undefined) bits.push(String(r.reason))
+            result.error = (result.error ? `${result.error} | ` : '') + bits.join(' — ')
+          }
         }
       }
     } catch (e) {
       result.assistantText = `[读输出异常] ${String(e)}`
+    }
+    // 完全无产出且无错误事件时给出可诊断的兜底(而不是一份"成功"的空结果)
+    if (!result.assistantText && !result.error) {
+      result.error = observedEvents === 0
+        ? 'no new session events observed (turn may not have started)'
+        : `turn produced no assistant output (observed ${observedEvents} events, none assistant/message)`
     }
 
     // 解析结构化 summary
@@ -484,13 +536,15 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     result.verification = summary.verification
     result.leftovers = summary.leftovers
 
-    // resume 兜底分支: 尽力 flush 持久化, 再释放我们 resume 出来的句柄(不留给僵尸 live agent)
+    // 持久化同步: 池会话与 resume 会话都在任务后尽力 flush(官方 whenIdle 注释: 消费者自读存储需自行 flush;
+    // 不 flush 的话 durable log 只有 header, 进程重启后的续接会丢历史)。失败不阻断结果返回。
+    try {
+      await (ctx.get('sessions') as { flush?: (session: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
+    } catch {
+      /* flush 失败不阻断结果返回 */
+    }
+    // resume 兜底分支: 再释放我们 resume 出来的独占句柄(不留给僵尸 live agent)
     if (disposeAfter) {
-      try {
-        await (ctx.get('sessions') as { flush?: (session: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
-      } catch {
-        /* flush 失败不阻断结果返回 */
-      }
       try {
         await handle.dispose()
       } catch {
@@ -594,21 +648,26 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(`收到: ${text} @ ${Date.now()}`)
   })
 
-  mcp.tool('dsh_list_tools', '列出 dsh 当前注册的所有工具(name + description)', {}, async () => {
-    // 0.1.5+: ctx.tools.schemas() 投影可见工具; 更早版本的 keys() 作为回退
-    const tools = ctx.tools as unknown as
-      | { schemas?: () => { name: string; description?: string }[]; keys?: () => Iterable<string> }
-      | null
-    let list: { name: string; description?: string }[]
-    if (tools && typeof tools.schemas === 'function') {
-      list = tools.schemas().map((s) => ({ name: s.name, description: s.description ?? '' }))
-    } else if (tools && typeof tools.keys === 'function') {
-      list = Array.from(tools.keys(), (n) => ({ name: n, description: '' }))
-    } else {
-      list = []
-    }
-    return out(JSON.stringify(list))
-  })
+  mcp.tool(
+    'dsh_list_tools',
+    '列出宿主全局工具注册表(name + description)。注意: 0.1.5+ 的模型工具挂在 preset/agent 作用域, 全局表通常为空; agent 实际可用的工具以 agent_run 结果里的 toolCalls 为准。',
+    {},
+    async () => {
+      // 0.1.5+: ctx.tools.schemas() 投影全局可见工具; 更早版本的 keys() 作为回退
+      const tools = ctx.tools as unknown as
+        | { schemas?: () => { name: string; description?: string }[]; keys?: () => Iterable<string> }
+        | null
+      let list: { name: string; description?: string }[]
+      if (tools && typeof tools.schemas === 'function') {
+        list = tools.schemas().map((s) => ({ name: s.name, description: s.description ?? '' }))
+      } else if (tools && typeof tools.keys === 'function') {
+        list = Array.from(tools.keys(), (n) => ({ name: n, description: '' }))
+      } else {
+        list = []
+      }
+      return out(JSON.stringify(list))
+    },
+  )
 
   // 同步执行任务(简单场景: 调用方下发 → 立即拿结果)
   mcp.tool(
@@ -802,15 +861,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     allowedHostSet.add(h.toLowerCase())
   }
 
-  // 存量捞回: 启动后异步补挂未分组会话, 不阻塞启动; 全程兜底 try/catch 防 unhandled rejection
-  void (async () => {
-    try {
-      const r = await reattachOrphanSessions(ctx)
-      console.log(`[dsh-ops-mcp] 存量捞回完成: attached=${r.attached} failed=${r.failed}`)
-    } catch (e) {
-      console.warn('[dsh-ops-mcp] 存量捞回异常:', (e as Error)?.message ?? e)
-    }
-  })()
+  // 存量捞回(默认关闭): 0.1.5 的 workspaceRegistry 已按 header.cwd 自动索引, 该操作只是给手动花名册
+  // 补条目——会对用户数据做批量持久化写入, 仅在明确需要时开启。
+  if (config.reattachOrphans === true) {
+    void (async () => {
+      try {
+        const r = await reattachOrphanSessions(ctx)
+        console.log(`[dsh-ops-mcp] 存量捞回完成: attached=${r.attached} failed=${r.failed}`)
+      } catch (e) {
+        console.warn('[dsh-ops-mcp] 存量捞回异常:', (e as Error)?.message ?? e)
+      }
+    })()
+  }
 
   // 标准 cordis 生命周期: 用 ctx.effect 注册清理(卸载时关 server + 清空全部映射/会话/队列)
   ctx.effect(() => {
