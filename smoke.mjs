@@ -222,13 +222,20 @@ try {
   const runLive = await rpc(init.sid, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-live' } } })
   const runLiveInner = runLive.status === 200 ? innerOf(runLive) : { error: 'bad' }
   checks['agent_run 接管 live 会话(不 resume 不 dispose)'] = runLiveInner.sessionId === 'sess-live' && resumed.length === 0 && disposed.length === 0
+  // 默认 summary 投影: 不泄漏 toolCalls/toolResults 原文, 只给尾部文本 + 工具名
+  checks['默认 summary 形状(省上下文)'] = runLiveInner.toolCalls === undefined && runLiveInner.toolResults === undefined
+    && Array.isArray(runLiveInner.toolCallNames) && runLiveInner.toolCallNames[0] === 'bash'
+    && typeof runLiveInner.assistantTail === 'string' && runLiveInner.assistantTail.includes('c1')
+    && runLiveInner.detail === 'summary'
 
-  const runPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-persisted' } } })
+  const runPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-persisted', detail: 'full' } } })
   const runPersistedInner = runPersisted.status === 200 ? innerOf(runPersisted) : { error: 'bad' }
   checks['agent_run 持久化会话 resume + flush + dispose'] = runPersistedInner.sessionId === 'sess-persisted'
     && resumed.some((r) => r.id === 'sess-persisted') && flushed.includes('sess-persisted') && disposed.includes('sess-persisted')
   checks['resume 也带完整模型选择(agentDefaultModel 补全)'] = resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.provider === 'p1'
     && resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.model === 'm1'
+  // full 档保留原文(排查用)
+  checks['detail=full 保留 toolCalls 原文'] = Array.isArray(runPersistedInner.toolCalls) && runPersistedInner.toolCalls[0]?.name === 'bash'
 
   const runUnknown = await rpc(init.sid, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-unknown' } } })
   checks['agent_run 未知会话明确报错'] = runUnknown.status === 200 && String(innerOf(runUnknown).error ?? '').includes('session not found for resume')
@@ -237,6 +244,19 @@ try {
   const runErr = await rpc(init.sid, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'boom', sessionId: 'sess-err' } } })
   const runErrInner = runErr.status === 200 ? innerOf(runErr) : { error: 'bad' }
   checks['agent_run 失败透出(turn/end error)'] = String(runErrInner.error ?? '').includes('AUTH') && String(runErrInner.error ?? '').includes('invalid api key')
+
+  // ── 异步队列: status 轮询不注入 payload, 完成后默认 summary ──
+  const inbox = await rpc(init.sid, { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'queued job' } } })
+  const inboxInner = inbox.status === 200 ? innerOf(inbox) : { error: 'bad' }
+  const queuedId = inboxInner.taskId
+  checks['task_inbox 返回 taskId'] = typeof queuedId === 'string' && queuedId.length > 0
+  await new Promise((r) => setTimeout(r, 300))
+  const stPoll = await rpc(init.sid, { jsonrpc: '2.0', id: 16, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: queuedId, detail: 'status' } } })
+  const stPollInner = stPoll.status === 200 ? innerOf(stPoll) : { error: 'bad' }
+  checks['task_result status 轮询: 不注入结果 payload'] = stPollInner.status === 'done' && stPollInner.changes === undefined && stPollInner.toolCallNames === undefined && stPollInner.assistantTail === undefined
+  const smFetch = await rpc(init.sid, { jsonrpc: '2.0', id: 17, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: queuedId } } })
+  const smFetchInner = smFetch.status === 200 ? innerOf(smFetch) : { error: 'bad' }
+  checks['task_result 默认 summary 投影'] = smFetchInner.changes === 'c1' && smFetchInner.toolCallNames?.[0] === 'bash' && smFetchInner.toolResults === undefined
 
   // 事件读取走 snapshotEvents + 结构化解析
   checks['结构化解析(toolCalls/changes/verification)'] = runPersistedInner.toolCalls?.length === 1

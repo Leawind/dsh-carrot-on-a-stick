@@ -28,12 +28,21 @@ dsh agent — full toolset: bash, fs, todo, web…
 | Tool | Purpose |
 |---|---|
 | `echo` | connectivity check |
-| `dsh_list_tools` | list tools registered in dsh (name + description) |
-| `agent_run` | run a task synchronously, structured result; pass `sessionId` to continue a session |
+| `dsh_list_tools` | list the host-global tool registry (name + description; model tools are preset-scoped, usually empty) |
+| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `detail` controls result size |
 | `task_inbox` | push a structured task (task + context + cwd) into the async queue, returns `taskId` |
-| `task_result` | fetch the structured result of a queued task |
+| `task_result` | fetch a queued task's result; `detail=status` is a lightweight poll that never re-injects the payload |
 | `attach_session` | attach a session to the workspace of its cwd |
 | `rename_session` | rename an existing session |
+
+**Result detail levels (token budget)** — the whole point of this plugin is saving the caller's (operator's) context: execution details stay inside dsh, and read-back is projected by `detail`:
+
+- `summary` (default, a few hundred tokens): the `changes/verification/leftovers` three-line summary + the answer tail (the summary JSON sits at the end) + tool-name list + `error`
+- `normal` (~2k tokens): the above + truncated tool-call arguments and results
+- `full` (up to tens of thousands of tokens, for debugging): the full text
+- `task_result` also has a `status` level: polling returns only `{taskId, status, error?}` — fetch the summary once after completion instead of re-injecting the payload on every poll
+
+When continuing the same `sessionId`, the executor already remembers prior turns — send only the **delta** in `context`.
 
 Every result is structured: `sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers` — ready to be persisted by the caller.
 
@@ -111,10 +120,11 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `allowedHosts` | — | extra allowed Host-header values; the bind host and loopback aliases are always allowed, everything else gets 403 |
 | `provider` / `model` | follow host user settings (`agentDefaultModel`) | spawned-agent model selection; **configure as a pair** — a partial setting is completed from the host default |
 | `preset` | `standard` | agent preset to mount |
+| `defaultDetail` | `summary` | default detail level for `agent_run`/`task_result` (overridable per call via `detail`) |
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
 
-Every result is structured: `sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers / error` — `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
+Every result is structured: `sessionId / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
 
 ## Zero host copies
 

@@ -44,7 +44,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.3.1'
+const PLUGIN_VERSION = '0.4.0'
 
 /**
  * 声明依赖的核心服务。
@@ -77,6 +77,8 @@ export interface Config {
   workspaceRoots?: string[]
   /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
   allowedHosts?: string[]
+  /** 结果默认详略级别(默认 summary; 单次调用可用 detail 参数覆盖) */
+  defaultDetail?: 'summary' | 'normal' | 'full'
   /**
    * 启动时存量捞回: 把现存未分组会话补挂到已注册工作区(默认 false)。
    * 0.1.5+ 的 workspaceRegistry 本身按 header.cwd 自动索引, 该操作只补充手动花名册——
@@ -97,6 +99,7 @@ const DEFAULTS = {
   maxAgents: 8,
   authToken: '',
   workspaceRoots: [] as string[],
+  defaultDetail: 'summary' as 'summary' | 'normal' | 'full',
 }
 
 type RuntimeConfig = typeof DEFAULTS
@@ -423,14 +426,78 @@ function parseSummary(assistantText: string): { changes: string; verification: s
   return empty
 }
 
-/** 分字段限长, 保证返回的永远是完整合法 JSON(避免 slice(-16000) 截断开头导致非法 JSON) */
-function truncateResult(result: TaskResult): TaskResult {
+// ── 结果投影: token 预算 ──
+//
+// 本插件的存在意义是省 operator(调用方)的上下文: 内部 TaskResult 始终全量(队列与 sessionId 续接
+// 不丢信息), 只在返回前按 detail 级别投影。各级字段上限的总和控制在预算内:
+//   summary(默认) ≤ ~3k 字符 ≈ 数百 token: 三行总结 + 回答尾部 + 工具名列表 + 错误
+//   normal       ≤ ~9k 字符: 上述 + 截断的工具调用参数与结果
+//   full         旧版行为(assistantText 8k / 50×2k / 20×2k), 仅排查时用
+
+/** 结果详略级别 */
+type DetailLevel = 'summary' | 'normal' | 'full'
+
+/** 各级别字段上限(字符) */
+const DETAIL_CAPS: Record<DetailLevel, {
+  summaryField: number
+  error: number
+  assistantTail: number
+  toolCalls: number
+  toolCallArgs: number
+  toolResults: number
+  toolResultChars: number
+  assistantText: number
+}> = {
+  summary: { summaryField: 300, error: 300, assistantTail: 1200, toolCalls: 0, toolCallArgs: 0, toolResults: 0, toolResultChars: 0, assistantText: 0 },
+  normal: { summaryField: 400, error: 600, assistantTail: 1200, toolCalls: 15, toolCallArgs: 250, toolResults: 6, toolResultChars: 400, assistantText: 0 },
+  full: { summaryField: 2000, error: 2000, assistantTail: 0, toolCalls: 50, toolCallArgs: 2000, toolResults: 20, toolResultChars: 2000, assistantText: 8000 },
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : text.slice(0, max)
+}
+
+const DETAIL_ARG = {
+  summary: 'summary(默认): 三行总结 + 回答尾部 + 工具名列表, ~数百 token',
+  normal: 'normal: 加上截断的工具调用参数与结果(~2k token)',
+  full: 'full: 完整原文(最坏数万 token, 仅排查用)',
+} as const
+
+/** 读时投影: 把全量 TaskResult 渲染成对应 detail 级别的返回载荷 */
+function renderResult(result: TaskResult, detail: DetailLevel): Record<string, unknown> {
+  const caps = DETAIL_CAPS[detail]
+  const base = {
+    detail,
+    taskId: result.taskId,
+    sessionId: result.sessionId,
+    toolCallCount: result.toolCalls.length,
+    toolResultCount: result.toolResults.length,
+    error: clip(result.error, caps.error),
+    changes: clip(result.changes, caps.summaryField),
+    verification: clip(result.verification, caps.summaryField),
+    leftovers: clip(result.leftovers, caps.summaryField),
+  }
+  if (detail === 'summary') {
+    // 总结 JSON 在回答末尾, 尾部最有信息量; 工具只报名字不报参数
+    return {
+      ...base,
+      assistantTail: result.assistantText.slice(-caps.assistantTail),
+      toolCallNames: result.toolCalls.map((c) => c.name),
+    }
+  }
+  if (detail === 'normal') {
+    return {
+      ...base,
+      assistantTail: result.assistantText.slice(-caps.assistantTail),
+      toolCalls: result.toolCalls.slice(0, caps.toolCalls).map((c) => ({ name: c.name, args: clip(c.args, caps.toolCallArgs) })),
+      toolResults: result.toolResults.slice(0, caps.toolResults).map((r) => clip(r, caps.toolResultChars)),
+    }
+  }
   return {
-    ...result,
-    assistantText: result.assistantText.slice(0, 8000),
-    toolCalls: result.toolCalls.slice(0, 50).map((c) => ({ ...c, args: c.args.slice(0, 2000) })),
-    toolResults: result.toolResults.slice(0, 20).map((r) => r.slice(0, 2000)),
-    error: result.error.slice(0, 2000),
+    ...base,
+    assistantText: result.assistantText.slice(0, caps.assistantText),
+    toolCalls: result.toolCalls.slice(0, caps.toolCalls).map((c) => ({ name: c.name, args: clip(c.args, caps.toolCallArgs) })),
+    toolResults: result.toolResults.slice(0, caps.toolResults).map((r) => clip(r, caps.toolResultChars)),
   }
 }
 
@@ -672,17 +739,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 同步执行任务(简单场景: 调用方下发 → 立即拿结果)
   mcp.tool(
     'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。',
+    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。默认返回 summary 级(省上下文), 需要 toolCalls 原文时传 detail=full。',
     {
       task: z.string().describe('要 Harness 执行的自然语言任务'),
-      context: z.string().optional().describe('调用方记忆/上下文, 注入给 agent 参考'),
+      context: z.string().optional().describe('调用方记忆/上下文, 注入给 agent 参考(续接同一 sessionId 时建议只发增量)'),
       cwd: z.string().optional().describe('工作目录(默认当前)'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
       title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
+      detail: z.enum(['summary', 'normal', 'full']).optional().describe(`结果详略: ${DETAIL_ARG.summary}; ${DETAIL_ARG.normal}; ${DETAIL_ARG.full}`),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
+    async ({ task, context, cwd, sessionId, title, detail }) => {
       const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
-      return out(JSON.stringify(truncateResult(result), null, 2))
+      return out(JSON.stringify(renderResult(result, detail ?? runtimeConfig.defaultDetail), null, 2))
     },
   )
 
@@ -735,20 +803,26 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
-  // 取回任务结果(结构化 changes/verification/leftovers)
+  // 取回任务结果(结构化 changes/verification/leftovers; 轮询用 status 档避免重复注入 payload)
   mcp.tool(
     'task_result',
-    '取回 task_inbox 提交任务的结构化结果(changes/verification/leftovers)。',
-    { taskId: z.string().describe('task_inbox 返回的 taskId') },
-    async ({ taskId }) => {
+    '取回 task_inbox 提交任务的结构化结果。轮询请传 detail=status(只返回状态, 不注入结果 payload, 完成后再取一次默认 summary)。',
+    {
+      taskId: z.string().describe('task_inbox 返回的 taskId'),
+      detail: z.enum(['status', 'summary', 'normal', 'full']).optional().describe(`结果详略: status=只查状态(轮询); ${DETAIL_ARG.summary}; ${DETAIL_ARG.normal}; ${DETAIL_ARG.full}`),
+    },
+    async ({ taskId, detail }) => {
       const item = taskQueue.get(taskId)
       if (!item) return out(JSON.stringify({ error: `task not found: ${taskId}` }))
-      return out(JSON.stringify({
-        taskId: item.id,
-        status: item.status,
-        error: item.error,
-        result: item.result ? truncateResult(item.result) : undefined,
-      }, null, 2))
+      // status 档 / 任务未完成: 轻量返回, 不带结果字段(避免轮询把 payload 重复灌进调用方上下文)
+      if (detail === 'status' || !item.result) {
+        return out(JSON.stringify({
+          taskId: item.id,
+          status: item.status,
+          ...(item.error ? { error: String(item.error).slice(0, 400) } : {}),
+        }))
+      }
+      return out(JSON.stringify(renderResult(item.result, detail ?? runtimeConfig.defaultDetail), null, 2))
     },
   )
 
@@ -848,6 +922,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     maxAgents: config.maxAgents ?? DEFAULTS.maxAgents,
     authToken: config.authToken ?? DEFAULTS.authToken,
     workspaceRoots: (config.workspaceRoots ?? []).map((r) => resolve(r)),
+    defaultDetail: config.defaultDetail ?? DEFAULTS.defaultDetail,
   }
 
   const port = config.port ?? 8090
