@@ -4,9 +4,11 @@
  * 工具集:
  *   - echo             : 验证 MCP server 连通
  *   - dsh_list_tools   : 列出 dsh 工具注册表(name + description)
+ *   - model_list       : 列出当前可路由的 provider/模型/推理档(选模型前先查这里)
  *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
  *   - task_inbox       : 调用方 push 结构化任务(任务+上下文)到 dsh 队列, 异步执行, 返回 taskId
  *   - task_result      : 取回任务的结构化结果(changes/verification/leftovers)
+ *   - select_model     : 切换已存在会话使用的模型(官方 selectModel 路径)
  *   - attach_session   : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session   : 给已有会话改名
  *
@@ -14,6 +16,10 @@
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
  * 启动时对存量未分组会话补挂一次(存量捞回)。
+ *
+ * 模型选择: 优先级 = 单次调用参数 > 插件 config(provider+model 成对) > 宿主默认选择
+ * (ctx.agentDefaultModel.currentSelection(), Web UI 建会话同款来源)。常驻会话按
+ * cwd + 模型三元组分池, 所以同一目录下不同模型各占一个会话; 会话内换模型走 select_model。
  *
  * ── 零宿主副本原则 ──
  * 运行时对 `@deepseek-ai/*` 零依赖: 所有 dsh 能力都经注入的宿主服务(ctx.agents/ctx.tools/…)访问,
@@ -41,6 +47,13 @@ export interface Config {
     provider?: string;
     /** 执行任务的模型(默认空 = 跟随宿主用户设置; 需与 provider 成对配置才生效) */
     model?: string;
+    /** 默认推理强度(适配器定义的 id; 空 = 跟随适配器/提供商默认) */
+    reasoningEffort?: string;
+    /**
+     * 是否允许调用方在单次调用里覆盖模型(agent_run/task_inbox 的 provider/model/reasoningEffort,
+     * 以及 select_model; 默认 true)。设为 false = 由部署锁死模型, 覆盖请求会被明确拒绝。
+     */
+    allowModelOverride?: boolean;
     /** 挂载的 agent preset(默认 standard) */
     preset?: string;
     /** 任务队列容量上限(默认 100) */

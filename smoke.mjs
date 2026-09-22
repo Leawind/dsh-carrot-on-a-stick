@@ -8,6 +8,9 @@
 //   5. preset mount 无 scope 预检, 直接调用(混装副本不再导致静默跳过)
 //   6. 事件读取走公开 API snapshotEvents()(私有 log 字段仅作旧宿主回退)
 //   7. 安全: Bearer 认证 401 / Host 白名单 403(防 DNS rebinding) / workspaceRoots 跨平台子目录匹配
+//   8. 模型选择: model_list(sessionController 官方目录 / llm 回退 / provider 过滤 / 投影省上下文)、
+//      agent_run+task_inbox 的 provider/model/reasoningEffort 覆盖、池按 cwd+模型分组、
+//      select_model 走官方 selectModel 并 re-key、allowModelOverride:false 门禁
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -18,6 +21,7 @@ const resumed = []
 const disposed = []
 const flushed = []
 const mounted = []
+const selectModelCalls = []
 const disposers = []
 
 // smoke 文件所在目录的 realpath(win32 反斜杠规范路径) —— 与 workspace.path / fs.realpath 结果同 canon
@@ -36,9 +40,10 @@ const wsRegistry = {
   create: async () => fakeWs,
 }
 
-function makeAgent(id, cwd) {
+function makeAgent(id, cwd, options) {
   const events = []
   return {
+    options,
     session: {
       id,
       header: { version: 0, id, createdAt: Date.now(), cwd },
@@ -58,7 +63,7 @@ function makeAgent(id, cwd) {
   }
 }
 
-const liveAgent = makeAgent('sess-live', FAKE_CWD)
+const liveAgent = makeAgent('sess-live', FAKE_CWD, { provider: 'live-p', model: 'live-m' })
 const liveSession2 = { id: 'sess-live2', header: { version: 0, id: 'sess-live2', createdAt: 1, cwd: FAKE_CWD } }
 
 // 失败路径: 只产出 turn/end{reason: error} 的 live 会话(模型调用失败的样子)
@@ -95,39 +100,82 @@ const fakeTools = {
   ],
 }
 
-const ctx = {
-  tools: fakeTools,
-  llm: {},
-  agents: {
-    get: (id) => (id === 'sess-live' ? liveAgent : id === 'sess-err' ? errAgent : undefined),
-    create: async ({ sessionId, meta, agentOptions, setup }) => {
-      const id = String(sessionId)
-      created.push({ id, cwd: meta?.cwd, agentOptions })
-      const agent = makeAgent(id, meta?.cwd)
-      if (setup) await setup({}, agent)
-      return { agent, dispose: async () => { disposed.push(id) } }
-    },
-    resume: async ({ resumeSessionId, agentOptions, setup }) => {
-      const id = String(resumeSessionId)
-      if (id !== 'sess-persisted') throw new Error(`no persisted session "${id}"`)
-      resumed.push({ id, agentOptions })
-      const agent = makeAgent(id, FAKE_CWD)
-      if (setup) await setup({}, agent)
-      return { agent, dispose: async () => { disposed.push(id) } }
-    },
+// ── 模型目录假服务(sessionController = 官方口径; llm = 回退口径) ──
+const fakeAgentDefaultModel = { currentSelection: () => ({ provider: 'p1', model: 'm1', reasoningEffort: 'host-effort' }) }
+const fakeSessionController = {
+  modelCatalog: async () => ({
+    default: { provider: 'p1', model: 'm1' },
+    routableProviders: ['p1', 'p2'],
+    groups: [
+      {
+        id: 'p1',
+        name: 'Provider One',
+        models: [
+          { id: 'm1', name: 'Model One', description: 'LONG-DESCRIPTION-MUST-NOT-LEAK' },
+          { id: 'm2', name: 'Model Two', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' } },
+        ],
+      },
+      { id: 'p2', name: 'Provider Two', models: [{ id: 'm9', name: 'Model Nine' }] },
+    ],
+    failures: [{ id: 'p3', name: 'Provider Three', message: 'no api key' }],
+  }),
+  selectModel: async (request) => {
+    selectModelCalls.push(request)
+    return { selected: { ...request, sessionId: undefined } }
   },
-  agentPresets: { mount: async (agentCtx, id) => { mounted.push(id ?? 'standard'); return { id: id ?? 'standard' } } },
-  sessions: fakeSessions,
-  sessionPersistence: fakePersistence,
-  workspaceRegistry: wsRegistry,
-  effect: (fn) => { const d = fn(); disposers.push(d); return d },
-  get: (name) => (name === 'workspaceRegistry' ? wsRegistry
-    : name === 'sessions' ? fakeSessions
-      : name === 'sessionPersistence' ? fakePersistence
-        : name === 'tools' ? fakeTools
-          : name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'p1', model: 'm1' }) }
-            : undefined),
 }
+const fakeLlm = {
+  listProviders: () => [{ id: 'p1', name: 'Provider One' }, { id: 'p2', name: 'Provider Two' }],
+  listModels: async (provider) => {
+    if (provider === 'p2') throw new Error('catalog unavailable')
+    return [{ provider, id: 'm1', name: 'Model One' }]
+  },
+}
+
+/**
+ * 最小假 ctx: services 里没有的走 undefined。
+ * sessionController 只作为同名属性提供(证明 serviceOf 的属性回退可用, 也方便造"没有它"的部署)。
+ */
+function makeCtx({ sessionController, llm = {} } = {}) {
+  return {
+    tools: fakeTools,
+    llm,
+    sessionController,
+    agents: {
+      get: (id) => (id === 'sess-live' ? liveAgent : id === 'sess-err' ? errAgent : undefined),
+      create: async ({ sessionId, meta, agentOptions, setup }) => {
+        const id = String(sessionId)
+        created.push({ id, cwd: meta?.cwd, agentOptions })
+        const agent = makeAgent(id, meta?.cwd, agentOptions)
+        if (setup) await setup({}, agent)
+        return { agent, dispose: async () => { disposed.push(id) } }
+      },
+      resume: async ({ resumeSessionId, agentOptions, setup }) => {
+        const id = String(resumeSessionId)
+        if (id !== 'sess-persisted') throw new Error(`no persisted session "${id}"`)
+        resumed.push({ id, agentOptions })
+        const agent = makeAgent(id, FAKE_CWD, agentOptions)
+        if (setup) await setup({}, agent)
+        return { agent, dispose: async () => { disposed.push(id) } }
+      },
+    },
+    agentPresets: { mount: async (agentCtx, id) => { mounted.push(id ?? 'standard'); return { id: id ?? 'standard' } } },
+    sessions: fakeSessions,
+    sessionPersistence: fakePersistence,
+    workspaceRegistry: wsRegistry,
+    effect: (fn) => { const d = fn(); disposers.push(d); return d },
+    // 依赖注入桩: 假 ctx 不是真 cordis, webServer 这类可选依赖在 headless 相位不应出现 → 不调用回调
+    inject: () => undefined,
+    get: (name) => (name === 'workspaceRegistry' ? wsRegistry
+      : name === 'sessions' ? fakeSessions
+        : name === 'sessionPersistence' ? fakePersistence
+          : name === 'tools' ? fakeTools
+            : name === 'agentDefaultModel' ? fakeAgentDefaultModel
+              : undefined),
+  }
+}
+
+const ctx = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm })
 
 const PORT = 8099
 const BASE = `http://127.0.0.1:${PORT}/mcp`
@@ -198,6 +246,7 @@ try {
   const toolsList = await rpc(init.sid, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} })
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
   checks['attach_session 在工具清单里'] = toolNames.includes('attach_session')
+  checks['model_list / select_model 在工具清单里'] = toolNames.includes('model_list') && toolNames.includes('select_model')
 
   // ── dsh_list_tools 走 schemas() ──
   const listTools = await rpc(init.sid, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'dsh_list_tools', arguments: {} } })
@@ -284,6 +333,72 @@ try {
   checks['存量捞回: 持久化会话补挂(快照形状)'] = attachedIds.includes('sess-persisted')
   checks['存量捞回: 持久化会话补挂(裸 header 形状)'] = attachedIds.includes('sess-legacy')
 
+  // ── 模型选择: model_list / 按调用覆盖 / select_model / 坏输入 ──
+  const modelList = await rpc(init.sid, { jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'model_list', arguments: {} } })
+  const ml = modelList.status === 200 ? innerOf(modelList) : { error: 'bad' }
+  checks['model_list 走 sessionController 官方目录'] = ml.source === 'sessionController'
+    && ml.default?.provider === 'p1' && ml.default?.model === 'm1'
+    && Array.isArray(ml.routableProviders) && ml.routableProviders.length === 2
+  checks['model_list 保留推理档、丢掉 description(省上下文)'] = JSON.stringify(ml).includes('reasoningEfforts')
+    && JSON.stringify(ml).includes('defaultReasoningEffort')
+    && !JSON.stringify(ml).includes('LONG-DESCRIPTION-MUST-NOT-LEAK')
+  checks['model_list 带 provider 失败信息与插件模型配置'] = ml.failures?.[0]?.id === 'p3'
+    && ml.config?.allowModelOverride === true && ml.config?.provider === null
+
+  const modelListP2 = await rpc(init.sid, { jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'model_list', arguments: { provider: 'p2' } } })
+  const mlP2 = modelListP2.status === 200 ? innerOf(modelListP2) : { error: 'bad' }
+  checks['model_list provider 过滤'] = mlP2.providers?.length === 1 && mlP2.providers[0].id === 'p2'
+    && mlP2.routableProviders.length === 1
+
+  // 按调用覆盖模型: create 收到覆盖值, 且与默认模型的会话分开(池按 cwd+模型分组)
+  const runOverride = await rpc(init.sid, { jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm9' } } })
+  const runOverrideInner = runOverride.status === 200 ? innerOf(runOverride) : { error: 'bad' }
+  const createdOverride = created.find((c) => c.agentOptions?.provider === 'p2')
+  checks['agent_run 按调用覆盖模型(create 用覆盖值)'] = Boolean(createdOverride)
+    && createdOverride.agentOptions.model === 'm9' && createdOverride.agentOptions.reasoningEffort === undefined
+  checks['显式钉住模型时不继承宿主默认推理档(与模型同源)'] = createdOverride?.agentOptions?.reasoningEffort === undefined
+    && created.find((c) => c.agentOptions?.provider === 'p1' && c.agentOptions?.model === 'm1')?.agentOptions?.reasoningEffort === 'host-effort'
+  checks['结果自报本次用的模型'] = runOverrideInner.model?.provider === 'p2' && runOverrideInner.model?.model === 'm9'
+  checks['不同模型各自一个常驻会话(池按模型分组)'] = Boolean(runOverrideInner.sessionId) && runOverrideInner.sessionId !== created[0]?.id
+
+  const createdBefore = created.length
+  const runOverrideAgain = await rpc(init.sid, { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm9' } } })
+  checks['同模型再调用命中池(不新建会话)'] = created.length === createdBefore
+    && innerOf(runOverrideAgain).sessionId === runOverrideInner.sessionId
+
+  // 只给 provider: 用宿主默认选择补 model(与 0.3.1 的补全语义一致)
+  const partialCwd = resolve(FAKE_CWD, 'nonexistent-partial-model')
+  await rpc(init.sid, { jsonrpc: '2.0', id: 34, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: partialCwd, provider: 'p3' } } })
+  checks['只给 provider 时用宿主默认补 model'] = created.find((c) => c.agentOptions?.provider === 'p3')?.agentOptions?.model === 'm1'
+
+  // reasoningEffort 透传(选项在 create 的 agentOptions 里, 不是被丢掉)
+  const effortCwd = resolve(FAKE_CWD, 'nonexistent-effort')
+  await rpc(init.sid, { jsonrpc: '2.0', id: 35, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: effortCwd, provider: 'p1', model: 'm1', reasoningEffort: 'high' } } })
+  checks['reasoningEffort 透传到 agentOptions'] = created.find((c) => c.agentOptions?.reasoningEffort === 'high')?.agentOptions?.provider === 'p1'
+
+  // 接管 live 会话时回报它自己的模型(读 agent.options)
+  checks['接管 live 会话回报其原有模型'] = runLiveInner.model?.provider === 'live-p' && runLiveInner.model?.model === 'live-m'
+
+  // select_model: 走官方 selectModel + 池 key 跟随新模型(re-key)
+  const selModel = await rpc(init.sid, { jsonrpc: '2.0', id: 36, method: 'tools/call', params: { name: 'select_model', arguments: { sessionId: runOverrideInner.sessionId, provider: 'p2', model: 'm10', reasoningEffort: 'high' } } })
+  const selInner = selModel.status === 200 ? innerOf(selModel) : { error: 'bad' }
+  checks['select_model 走官方 selectModel 并回报归一化选择'] = selInner.ok === true
+    && selectModelCalls.at(-1)?.sessionId === runOverrideInner.sessionId
+    && selectModelCalls.at(-1)?.model === 'm10' && selectModelCalls.at(-1)?.reasoningEffort === 'high'
+    && selInner.selected?.model === 'm10' && selInner.selected?.reasoningEffort === 'high'
+
+  const createdBeforeRekey = created.length
+  const runAfterRekey = await rpc(init.sid, { jsonrpc: '2.0', id: 37, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm10', reasoningEffort: 'high' } } })
+  checks['select_model 后池 key 跟随新模型(re-key, 不误开新会话)'] = created.length === createdBeforeRekey
+    && innerOf(runAfterRekey).sessionId === runOverrideInner.sessionId
+
+  // 队列侧也带模型覆盖
+  const inboxModel = await rpc(init.sid, { jsonrpc: '2.0', id: 38, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'queued with model', cwd: FAKE_CWD, provider: 'p2', model: 'm9' } } })
+  const inboxModelId = innerOf(inboxModel).taskId
+  await new Promise((r) => setTimeout(r, 300))
+  const inboxModelResult = await rpc(init.sid, { jsonrpc: '2.0', id: 39, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: inboxModelId } } })
+  checks['task_inbox 的模型覆盖生效(结果自报模型)'] = innerOf(inboxModelResult).model?.model === 'm9'
+
   // 卸载 Phase B(清空池/队列/server), 再起 Phase A
   for (const d of disposers.splice(0)) {
     if (typeof d === 'function') d()
@@ -349,6 +464,65 @@ try {
   const runOutside = await rpcA(sidA, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: outsideDir } } })
   const runOutsideInner = runOutside.status === 200 ? innerOf(runOutside) : { error: String(runOutside) }
   checks['workspaceRoots: 白名单外目录拒绝'] = String(runOutsideInner.error ?? '').includes('not allowed')
+
+  // 卸载 Phase A, 再起模型回退/门禁两个 phase(每个 phase 独立端口 + 独立假 ctx)
+  for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+  await new Promise((r) => setTimeout(r, 200))
+
+  /** 起一个独立 phase: 返回调用器(自带 initialize) */
+  async function startPhase(port2, ctx2, config) {
+    await apply(ctx2, { port: port2, host: '127.0.0.1', ...config })
+    await new Promise((r) => setTimeout(r, 200))
+    const base = `http://127.0.0.1:${port2}/mcp`
+    const post = async (sessionId, body) => {
+      const res = await fetch(base, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
+        },
+        body: JSON.stringify(body),
+      })
+      return { sid: res.headers.get('mcp-session-id') ?? sessionId, status: res.status, text: await res.text() }
+    }
+    const init2 = await post(undefined, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-phase', version: '1.0' } } })
+    await post(init2.sid, { jsonrpc: '2.0', method: 'notifications/initialized' })
+    let n = 100
+    return { sid: init2.sid, call: (toolName, args) => post(init2.sid, { jsonrpc: '2.0', id: n++, method: 'tools/call', params: { name: toolName, arguments: args } }) }
+  }
+
+  // ── Phase C: 没有 sessionController(headless 类部署)——目录回退 llm, 覆盖仍可用, select_model 明确报不可用 ──
+  const phaseC = await startPhase(8096, makeCtx({ llm: fakeLlm }), {})
+  const mlC = innerOf(await phaseC.call('model_list', {}))
+  checks['model_list 回退 llm.listProviders/listModels'] = mlC.source === 'llm'
+    && mlC.providers?.length === 2 && mlC.providers.find((p) => p.id === 'p1')?.models?.[0]?.id === 'm1'
+  checks['model_list 回退口径: 单 provider 失败被隔离'] = mlC.failures?.some((f) => f.id === 'p2')
+    && mlC.providers.find((p) => p.id === 'p2')?.models.length === 0
+  checks['model_list 回退口径仍报缺省选择'] = mlC.default?.provider === 'p1' && mlC.default?.model === 'm1'
+
+  const overrideNoSc = await phaseC.call('agent_run', { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm9' })
+  checks['无 sessionController 时按调用覆盖模型仍可用'] = innerOf(overrideNoSc).model?.model === 'm9'
+
+  const selNoSc = innerOf(await phaseC.call('select_model', { sessionId: 'sess-live', provider: 'p2', model: 'm9' }))
+  checks['无 sessionController 时 select_model 明确报不可用'] = String(selNoSc.error ?? '').includes('sessionController service unavailable')
+
+  for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+  await new Promise((r) => setTimeout(r, 200))
+
+  // ── Phase D: allowModelOverride:false —— 部署锁死模型, 覆盖被明确拒绝, 不覆盖仍可用 ──
+  const phaseD = await startPhase(8095, makeCtx({ sessionController: fakeSessionController, llm: fakeLlm }), { allowModelOverride: false })
+  const mlD = innerOf(await phaseD.call('model_list', {}))
+  checks['allowModelOverride:false 在 model_list 里可见'] = mlD.config?.allowModelOverride === false
+
+  const deniedRun = innerOf(await phaseD.call('agent_run', { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm9' }))
+  checks['allowModelOverride:false 时按调用选模型被拒'] = String(deniedRun.error ?? '').includes('allowModelOverride')
+
+  const deniedSel = innerOf(await phaseD.call('select_model', { sessionId: 'sess-live', provider: 'p2', model: 'm9' }))
+  checks['allowModelOverride:false 时 select_model 被拒'] = String(deniedSel.error ?? '').includes('allowModelOverride')
+
+  const allowedRun = innerOf(await phaseD.call('agent_run', { task: 'say ok', cwd: FAKE_CWD }))
+  checks['allowModelOverride:false 不影响不带覆盖的调用'] = Boolean(allowedRun.sessionId) && allowedRun.error === ''
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [checkName, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${checkName}`)

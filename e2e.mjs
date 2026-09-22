@@ -1,10 +1,12 @@
 // E2E verification against a REAL dsh host (not shipped; dev-only).
-// Zero-token phase: initialize / tools/list / echo / dsh_list_tools.
+// Zero-token phase: initialize / tools/list / echo / dsh_list_tools / model_list.
 // Agent phase (E2E_WITH_AGENT=1): one minimal tool-using agent_run — verifies preset
 // mounting (toolCalls non-empty), local userMessage() acceptance, snapshotEvents
 // extraction, and the summary contract on a live agent-loop.
 //
 // Usage: E2E_MCP_URL=http://127.0.0.1:8090/mcp [E2E_WITH_AGENT=1] node e2e.mjs
+// E2E_MODEL_LIST=0 skips the read-only model_list leg (it asks the host's model
+// adapters for their catalogs, so it can be slow on a cold adapter).
 const BASE = process.env.E2E_MCP_URL ?? 'http://127.0.0.1:8090/mcp'
 const WITH_AGENT = process.env.E2E_WITH_AGENT === '1'
 const CWD = process.env.E2E_CWD ?? process.cwd()
@@ -64,8 +66,8 @@ try {
 
   const toolsList = await rpc(sid, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
   const names = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
-  const expected = ['echo', 'dsh_list_tools', 'agent_run', 'task_inbox', 'task_result', 'attach_session', 'rename_session']
-  report('tools/list 七工具齐', expected.every((n) => names.includes(n)), names.join(','))
+  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'select_model', 'attach_session', 'rename_session']
+  report('tools/list 九工具齐(含 model_list/select_model)', expected.every((n) => names.includes(n)), names.join(','))
 
   const echo = await rpc(sid, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'e2e-ping' } } })
   report('echo 往返', echo.status === 200 && echo.text.includes('e2e-ping'))
@@ -73,6 +75,35 @@ try {
   const listTools = await rpc(sid, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'dsh_list_tools', arguments: {} } })
   const lt = innerOf(listTools)
   report('dsh_list_tools 返回数组', Array.isArray(lt), Array.isArray(lt) ? `${lt.length} 个全局工具: ${lt.slice(0, 8).map((t) => t.name).join(',')}${lt.length > 8 ? '…' : ''}` : String(lt.error).slice(0, 120))
+
+  // ── model_list(只读): 真机模型目录 ──
+  if (process.env.E2E_MODEL_LIST !== '0') {
+    const mlT0 = Date.now()
+    const modelList = await rpc(sid, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'model_list', arguments: {} } })
+    const ml = innerOf(modelList)
+    const secs = ((Date.now() - mlT0) / 1000).toFixed(1)
+    const modelCount = (ml.providers ?? []).reduce((n, p) => n + (p.models?.length ?? 0), 0)
+    report('model_list 返回目录', !ml.error && Array.isArray(ml.providers), ml.error
+      ? String(ml.error).slice(0, 160)
+      : `${secs}s source=${ml.source} providers=${ml.providers.length} models=${modelCount} default=${JSON.stringify(ml.default)}`)
+    report('model_list 报出可用模型 id', modelCount > 0 || (ml.failures?.length ?? 0) > 0,
+      modelCount > 0
+        ? (ml.providers.flatMap((p) => (p.models ?? []).map((m) => `${p.id}/${m.id}`)).slice(0, 6).join(', '))
+        : `failures=${JSON.stringify(ml.failures ?? []).slice(0, 160)}`)
+    report('model_list 报出插件模型配置与覆盖开关', typeof ml.config?.allowModelOverride === 'boolean',
+      `config=${JSON.stringify(ml.config ?? null)}`)
+  }
+
+  // ── select_model 接线(只读式探针): 用一个不存在的会话 id, 期望宿主拒绝而不是"服务不可用" ──
+  const probe = await rpc(sid, {
+    jsonrpc: '2.0', id: 6, method: 'tools/call',
+    params: { name: 'select_model', arguments: { sessionId: 'e2e-nonexistent-session', provider: 'x', model: 'y' } },
+  })
+  const probeInner = innerOf(probe)
+  const probeErr = String(probeInner.error ?? '')
+  report('select_model 已接上官方 sessionController(不存在会话被拒)', probeInner.ok !== true && probeErr !== ''
+    && !probeErr.includes('sessionController service unavailable'),
+  probeErr.slice(0, 160))
 
   if (!WITH_AGENT) {
     console.log('\n(zero-token phase done; set E2E_WITH_AGENT=1 for the live agent_run leg)')

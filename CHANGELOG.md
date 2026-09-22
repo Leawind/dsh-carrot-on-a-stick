@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0
+
+**模型选择面补齐**——原版只能用插件 config 在**部署级**定一个模型，调用方无法按任务/按会话选模型，也看不到有哪些可选。本次把三条路径接上，并保持"零宿主副本"原则：
+
+- 新增 `model_list` 工具：列当前可路由的 provider / 模型 id / 推理档与缺省选择。
+  - 优先走官方 `sessionController.modelCatalog()`（与 Web UI 模型选择器同一数据源，含 `default` /
+    `routableProviders` / 各 provider 加载失败）；
+  - 该服务缺席时（headless 类部署）回退 `llm.listProviders()` + 逐个 `listModels()`，逐 provider
+    隔离失败，并如实标注 `source=llm`（回退口径不含推理档元数据）；
+  - 投影只保留 `id/name/reasoningEfforts/defaultReasoningEffort`，丢掉 `description` 等长字段省上下文；
+  - 同时回报插件自身模型配置与 `allowModelOverride`，调用方一眼看出能不能自己选。
+- `agent_run` / `task_inbox` 新增 `provider` / `model` / `reasoningEffort`：**优先级 = 调用参数 >
+  插件 config > 宿主默认选择**（`agentDefaultModel`），只给一边时用低优先级来源补另一边，补齐不了
+  仍明确报错（`{{model}}` 变量无值的教训保持不变）。`task_inbox` 的覆盖随任务入队保存。
+  **推理强度与模型同源**：显式钉住 provider+model 时不继承宿主默认档位——真机实测宿主默认选择里带
+  `reasoningEffort: high`，而无条件继承会把"为别的模型选的档位"套到被钉住的模型上（宿主对不支持的
+  显式 effort 直接拒绝，不做 clamp），真机验证时发现并改掉了这一版初稿行为。
+- 新增 `select_model` 工具：走官方 `sessionController.selectModel` 在**同一会话内**换模型
+  （校验 + 写一条持久通知，下一个 step 生效，历史保留）。服务缺席时报明确不可用，并提示改用覆盖参数。
+- **常驻会话池改按 `cwd + 模型三元组` 分组**（原来是按 cwd）：同一目录下不同模型各占一个会话，
+  "这个会话在用哪个模型"始终可预期；`select_model` 成功后池 key 跟随新模型 re-key，不会误开新会话。
+- 结果新增 `model: {provider, model, reasoningEffort?}`（summary/normal/full 三档都有），
+  接管 UI 手开会话时读 `agent.options` 如实回报；`task_result` 的 `status` 档仍不带 payload。
+- 新配置：`reasoningEffort`（默认推理强度）、`allowModelOverride`（默认 `true`；设 `false` 时部署锁死
+  模型，`agent_run`/`task_inbox`/`select_model` 的覆盖与切换被明确拒绝，不带覆盖的调用照常）。
+- 冒烟测试 31 → 57 项：官方目录 / 回退目录 / provider 过滤 / 投影不泄漏 description / 按调用覆盖 /
+  池按模型分组 / 同模型命中池 / 只给 provider 的补全 / reasoningEffort 透传与"同源不继承" /
+  live 会话模型回报 / select_model + re-key / 队列侧覆盖 / 无 sessionController 的降级 /
+  `allowModelOverride:false` 门禁。
+- E2E 客户端(零 token 相位)扩到 8 项：加 `model_list` 真机目录断言与 `select_model` 接线探针
+  （不存在的会话 id，期望宿主拒绝而非"服务不可用"，不改动任何真实会话）。真机结果：9 工具齐、
+  `source=sessionController`、7 provider / 21 模型、`select_model` 报 `session not found`。
+- 顺带修掉仓库里已有的冒烟断裂：`client/` 那批 GUI 改动引入 `ctx.inject(['webServer'])` 后，
+  `smoke.mjs` / `smoke-port.mjs` 的假 ctx 缺 `inject` 桩，`npm run smoke` 在改动前就已失败。
+- CI：GitHub Actions——`ci.yml` 在 push main / PR 时跑测试矩阵（ubuntu + windows × node 22/24，
+  `npm ci` → `npm test` = 构建 + 全量冒烟）；`publish.yml` 在推 `v*` 标签（或手动 dispatch）时
+  构建测试通过后 `npm publish --provenance` 发布 npm，tag 与 `package.json` 版本不一致直接拒绝。
+
 ## 0.4.0
 
 **结果分级与 token 预算**——本插件的存在意义是省调用方上下文, 本次把"骨架对、默认浪费"的返回体积问题修掉:

@@ -15,7 +15,7 @@ dsh ships a complete agent runtime — model routing, tool sandbox, presets, per
 
 ```
 MCP client (Claude Code / Codex / another dsh / …)
-   │  agent_run / task_inbox / task_result (HTTP + Bearer)
+   │  agent_run / task_inbox / task_result / model_list / select_model (HTTP + Bearer)
    ▼
 dsh-ops-mcp (MCP server, 127.0.0.1:8090)
    │  ctx.agents.create → mount preset
@@ -29,11 +29,34 @@ dsh agent — full toolset: bash, fs, todo, web…
 |---|---|
 | `echo` | connectivity check |
 | `dsh_list_tools` | list the host-global tool registry (name + description; model tools are preset-scoped, usually empty) |
-| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `detail` controls result size |
-| `task_inbox` | push a structured task (task + context + cwd) into the async queue, returns `taskId` |
+| `model_list` | list currently routable providers, model ids, reasoning efforts, and the default selection (look here before picking a model) |
+| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size |
+| `task_inbox` | push a structured task (task + context + cwd + model) into the async queue, returns `taskId` |
 | `task_result` | fetch a queued task's result; `detail=status` is a lightweight poll that never re-injects the payload |
+| `select_model` | switch the model of an **existing session** (official `sessionController.selectModel` path) |
 | `attach_session` | attach a session to the workspace of its cwd |
 | `rename_session` | rename an existing session |
+
+## Model selection
+
+Priority: **per-call arguments > plugin config (`provider`+`model`) > host default selection** (`ctx.agentDefaultModel.currentSelection()`, the same source the Web UI uses when creating a session). Supplying only one half completes it from the lower-priority source; if the pair still cannot be resolved the call fails loudly instead of running with an empty model (an empty model leaves the persona's `{{model}}` variable unset and fails the whole turn at assembly time).
+
+**`reasoningEffort` follows the model's source**: call argument > plugin config > the host default selection's own effort. But when the caller or the plugin config **pins provider+model explicitly**, the host's effort (chosen for some other model) is not inherited — the host rejects unsupported explicit efforts instead of clamping or aliasing, so inheriting one would break a deployment that used to work.
+
+Three ways to change models:
+
+| Goal | How |
+|---|---|
+| Run this one task on another model | pass `provider`+`model` (plus optional `reasoningEffort`) to `agent_run` / `task_inbox` |
+| Switch models mid-conversation, keeping history | `select_model` (official `sessionController.selectModel`: validated, writes a durable notice, takes effect on the next step; history is preserved) |
+| Pin one model for the whole deployment | set `provider`+`model` in the plugin config and `allowModelOverride: false` to refuse caller overrides |
+
+Two source semantics worth knowing:
+
+- **The resident session pool is keyed by `cwd + model triple`.** Task 1 on model A and task 2 on model B in the same directory are two separate sessions (no shared context), so which model a session uses is always predictable; to switch models inside one session, use `select_model`.
+- Results now carry `model: {provider, model, reasoningEffort?}` so the caller never has to guess who answered.
+
+`model_list`'s `source` names the catalog's origin: `sessionController` = the official view (same data source as the Web UI's model selector; includes `default`, `routableProviders`, per-provider load failures, and reasoning efforts); `llm` = fallback (`llm.listProviders()` + per-provider `listModels()`, for deployments without `sessionController`, e.g. headless, and without reasoning metadata). It also reports the plugin's own model config and `allowModelOverride`, so a caller can see at a glance whether it may choose.
 
 **Result detail levels (token budget)** — the whole point of this plugin is saving the caller's (operator's) context: execution details stay inside dsh, and read-back is projected by `detail`:
 
@@ -44,9 +67,9 @@ dsh agent — full toolset: bash, fs, todo, web…
 
 When continuing the same `sessionId`, the executor already remembers prior turns — send only the **delta** in `context`.
 
-Every result is structured: `sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers` — ready to be persisted by the caller.
+Every result is structured: `sessionId / model / assistantText / toolCalls / toolResults / changes / verification / leftovers` — ready to be persisted by the caller.
 
-Sessions are reused per cwd (LRU, default 8) to avoid reloading project context on every call.
+Sessions are reused per `cwd + model` (LRU, default 8) to avoid reloading project context on every call.
 
 ## Install & run
 
@@ -110,6 +133,9 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
         # allowedHosts: ['my-box.lan']     # extra allowed Host header values (DNS-rebinding guard)
         # preset: 'standard'               # agent preset to mount
         # model: ''                        # empty = follow dsh user/default settings
+        # provider: ''                     # pair with model; empty = follow host default
+        # reasoningEffort: ''              # default reasoning effort (empty = adapter default)
+        # allowModelOverride: true         # false = pin the model, refuse caller overrides
 ```
 
 | Field | Default | Meaning |
@@ -119,12 +145,14 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `workspaceRoots` | — | cwd whitelist; agents may only work inside the listed directories (subdirs included) |
 | `allowedHosts` | — | extra allowed Host-header values; the bind host and loopback aliases are always allowed, everything else gets 403 |
 | `provider` / `model` | follow host user settings (`agentDefaultModel`) | spawned-agent model selection; **configure as a pair** — a partial setting is completed from the host default |
+| `reasoningEffort` | adapter default | default reasoning effort (adapter-defined id, see `reasoningEfforts` in `model_list`) |
+| `allowModelOverride` | `true` | whether callers (`agent_run`/`task_inbox`/`select_model`) may override the model; `false` pins it and refuses overrides explicitly |
 | `preset` | `standard` | agent preset to mount |
 | `defaultDetail` | `summary` | default detail level for `agent_run`/`task_result` (overridable per call via `detail`) |
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
 
-Every result is structured: `sessionId / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
+Every result is structured: `sessionId / model / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
 
 ## Zero host copies
 
@@ -158,13 +186,17 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 ## Roadmap / known limitations (against dsh 0.1.5-rc.2)
 
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
+**0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
 
 What remains:
 
 - [ ] The task queue lives in process memory; a restart loses it (persistence is future work).
-- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it; callers should bring their own MCP-level timeout.
+- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it; callers should bring their own MCP-level timeout. The queue cannot be listed or cancelled either.
+- [ ] Read-only query surface is still incomplete: no `session_list` (list sessions, read history, read a session's current model) — only `attach_session` / `rename_session` / `select_model`.
+- [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
 - [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
 - [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
+- [ ] `select_model` requires the web profile's `sessionController`; where that service is absent (e.g. headless) only the catalog fallback and per-call overrides work, and the tool says so explicitly.
 - [ ] When dsh releases new versions, the `@deepseek-ai/*` devDependencies need syncing (compile-time only; the zero-runtime-dependency design is unaffected).
 
 ## Development
@@ -172,7 +204,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098 (27 checks, real MCP protocol round-trips)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095 (57 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
 
