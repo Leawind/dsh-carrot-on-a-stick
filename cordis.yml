@@ -1,0 +1,8 @@
+# --patch 加载插件(patch 格式): 在 Harness 内部启动 MCP server(8090), 把 dsh 的操作能力暴露给任意 MCP 客户端
+- insert:
+    - id: dsh-ops-mcp
+      name: 'dsh-ops-mcp'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1
