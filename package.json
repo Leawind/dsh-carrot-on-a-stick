@@ -1,6 +1,6 @@
 {
   "name": "dsh-ops-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Operate DeepSeek Harness (dsh) over MCP: expose dsh sessions, task execution, and workspace management as an MCP server for any MCP client.",
   "type": "module",
   "main": "lib/index.js",
@@ -9,11 +9,13 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
-    }
+    },
+    "./client": "./client/client.js"
   },
   "files": [
     "lib",
     "src",
+    "client",
     "cordis.yml",
     "README.md",
     "README.zh-CN.md",
@@ -21,7 +23,10 @@
   ],
   "scripts": {
     "build": "tsc -p .",
+    "dev": "tsc -p . --watch",
     "smoke": "node smoke.mjs && node smoke-port.mjs",
+    "pretest": "npm run build",
+    "test": "npm run smoke",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -44,6 +49,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "license": "MIT",

@@ -4,9 +4,11 @@
  * 工具集:
  *   - echo             : 验证 MCP server 连通
  *   - dsh_list_tools   : 列出 dsh 工具注册表(name + description)
+ *   - model_list       : 列出当前可路由的 provider/模型/推理档(选模型前先查这里)
  *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
  *   - task_inbox       : 调用方 push 结构化任务(任务+上下文)到 dsh 队列, 异步执行, 返回 taskId
  *   - task_result      : 取回任务的结构化结果(changes/verification/leftovers)
+ *   - select_model     : 切换已存在会话使用的模型(官方 selectModel 路径)
  *   - attach_session   : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session   : 给已有会话改名
  *
@@ -14,6 +16,10 @@
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
  * 启动时对存量未分组会话补挂一次(存量捞回)。
+ *
+ * 模型选择: 优先级 = 单次调用参数 > 插件 config(provider+model 成对) > 宿主默认选择
+ * (ctx.agentDefaultModel.currentSelection(), Web UI 建会话同款来源)。常驻会话按
+ * cwd + 模型三元组分池, 所以同一目录下不同模型各占一个会话; 会话内换模型走 select_model。
  *
  * ── 零宿主副本原则 ──
  * 运行时对 `@deepseek-ai/*` 零依赖: 所有 dsh 能力都经注入的宿主服务(ctx.agents/ctx.tools/…)访问,
@@ -30,7 +36,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -44,7 +50,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.4.0'
+const PLUGIN_VERSION = '0.5.0'
 
 /**
  * 声明依赖的核心服务。
@@ -63,6 +69,13 @@ export interface Config {
   provider?: string
   /** 执行任务的模型(默认空 = 跟随宿主用户设置; 需与 provider 成对配置才生效) */
   model?: string
+  /** 默认推理强度(适配器定义的 id; 空 = 跟随适配器/提供商默认) */
+  reasoningEffort?: string
+  /**
+   * 是否允许调用方在单次调用里覆盖模型(agent_run/task_inbox 的 provider/model/reasoningEffort,
+   * 以及 select_model; 默认 true)。设为 false = 由部署锁死模型, 覆盖请求会被明确拒绝。
+   */
+  allowModelOverride?: boolean
   /** 挂载的 agent preset(默认 standard) */
   preset?: string
   /** 任务队列容量上限(默认 100) */
@@ -93,6 +106,8 @@ const DEFAULTS = {
   // E2E 教训: 只传 provider 不传 model 会让 persona 提示词的 {{model}} 变量无值, 整个 turn 在组装期失败。
   provider: '',
   model: '',
+  reasoningEffort: '',
+  allowModelOverride: true,
   preset: 'standard',
   maxQueue: 100,
   taskTtlMs: 10 * 60 * 1000,
@@ -218,19 +233,58 @@ function isWithin(root: string, dir: string): boolean {
 
 // ── agent 会话池 ──
 
-/** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文) */
-const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle }>()
+/** 一次模型选择: provider+model 必成对; reasoningEffort 可选 */
+interface ModelSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
 
-/** sessionId → cwd 索引(支持按 session 续接: 指定 sessionId 时定位到对应 cwd 的常驻会话) */
-const sessionToCwd = new Map<string, string>()
+/** 调用方单次调用的模型覆盖(三项都可选; 只给一边时由插件 config / 宿主默认补另一边) */
+type ModelSelectionOverride = Partial<ModelSelection>
+
+/** 池中常驻 agent 的记录: 记下 cwd 与模型选择, 供 sessionId 续接与"改模型后重新入池"复用 */
+interface PooledAgent {
+  sessionId: SessionId
+  handle: AgentHandle
+  /** realpath 规范化后的 cwd(池 key 的第一段) */
+  cwd: string
+  /** 建这个会话时用的模型选择(结果回报与 re-key 用) */
+  selection: ModelSelection
+}
+
+/** 常驻 agent 会话(按 cwd + 模型三元组复用, 省 token: 避免每次全量加载项目上下文) */
+const liveAgents = new Map<string, PooledAgent>()
+
+/** sessionId → 池 key 索引(支持按 session 续接: 指定 sessionId 时定位到对应常驻会话) */
+const sessionToPoolKey = new Map<string, string>()
 
 /** 每个 cwd 的串行执行锁(防同一 agent 会话被并发 followup 冲突) */
 const agentLocks = new Map<string, Promise<unknown>>()
+
+/**
+ * 池 key = cwd + 模型三元组。
+ * 带上模型是"按调用选模型"的基础: 同一目录下不同模型各占一个常驻会话, 而不是共用一个会话
+ * 中途漂移模型——这样"用 A 模型跑任务1、B 模型跑任务2"在同一 cwd 里也可预期
+ * (代价: 这两个会话不共享上下文)。想在同一个会话里换模型请用 select_model。
+ */
+function poolKey(cwd: string, selection: ModelSelection): string {
+  return [cwd, selection.provider, selection.model, selection.reasoningEffort ?? ''].join('\u0000')
+}
+
+/** 取宿主服务: 优先 ctx.get(可选依赖的官方姿势), 回退同名属性(最小假 ctx / 旧宿主) */
+function serviceOf<T>(ctx: Context, name: string): T | undefined {
+  const viaGet = (ctx as { get?: (n: string) => unknown }).get?.(name)
+  if (viaGet !== undefined) return viaGet as T
+  return (ctx as unknown as Record<string, unknown>)[name] as T | undefined
+}
 
 /** getAgent 的返回: handle 恒有 .agent; resume 出来的独占句柄带 disposeAfter 标记, 任务结束后应 flush+dispose */
 interface ResolvedAgent {
   sessionId: SessionId
   handle: AgentHandle
+  /** 本会话的模型选择(池命中/live 接管读其原有选择; resume 用现算的选择) */
+  selection: ModelSelection
   /** true = 本插件 resume 出来的独占句柄; false/缺省 = 常驻池会话或 live 接管(生命周期归池/owner) */
   disposeAfter?: boolean
 }
@@ -245,58 +299,119 @@ async function mountPreset(ctx: Context, agentCtx: Context): Promise<void> {
 }
 
 /**
- * 解析生成 agent 的模型选择: provider+model 成对显式配置直接用; 部分配置用宿主默认选择
- * (ctx.agentDefaultModel.currentSelection(), Web UI 建会话同款来源)补全另一边; 仍不完整则明确报错。
+ * 读宿主默认模型选择(agentDefaultModel; 未挂载该插件时为 undefined)。
+ * 与 Web UI 建会话同款来源——插件不自己维护一份"默认模型"。
+ */
+function hostDefaultSelection(ctx: Context): ModelSelectionOverride | undefined {
+  return serviceOf<{ currentSelection?: () => ModelSelectionOverride | undefined }>(ctx, 'agentDefaultModel')
+    ?.currentSelection?.()
+}
+
+/** 调用是否携带了任一模型覆盖字段(用于 allowModelOverride 门禁与"没有覆盖"判定) */
+function hasModelOverride(override?: ModelSelectionOverride): boolean {
+  return override !== undefined
+    && (override.provider !== undefined || override.model !== undefined || override.reasoningEffort !== undefined)
+}
+
+/** 把 MCP 工具的可选参数收敛成 override(MCP 客户端可能把空串当"未提供", 一并当没有) */
+function selectionOverrideOf(args: { provider?: string; model?: string; reasoningEffort?: string }): ModelSelectionOverride | undefined {
+  const o: ModelSelectionOverride = {}
+  if (args.provider) o.provider = args.provider
+  if (args.model) o.model = args.model
+  if (args.reasoningEffort) o.reasoningEffort = args.reasoningEffort
+  return hasModelOverride(o) ? o : undefined
+}
+
+/**
+ * 解析生成 agent 的模型选择, 优先级: 单次调用覆盖 > 插件 config > 宿主默认选择。
+ * provider+model 必须成对解析出来: 只给一边时用低优先级来源补另一边, 补齐不了直接抛错。
+ * reasoningEffort 与模型同源(见下), 显式钉住模型时不继承宿主默认档位。
  *
  * 背景(E2E 实测): agent-loop 把 {{model}} 提示词变量直接读 agent.options.model, 不做任何默认解析——
  * 默认模型的解析发生在 Web 应用层。插件直连 ctx.agents.create 时必须自带完整选择,
  * 否则 persona 组装期 "{{model}} has no value" 让整个 turn 失败。
  */
-function resolveAgentOptions(ctx: Context): { provider: string; model: string } {
-  const { provider, model } = runtimeConfig
-  if (provider && model) return { provider, model }
-  const def = (ctx.get('agentDefaultModel') as {
-    currentSelection?: () => { provider?: string; model?: string } | undefined
-  } | undefined)?.currentSelection?.()
-  const p = provider || def?.provider
-  const m = model || def?.model
-  if (p && m) return { provider: p, model: m }
-  throw new Error(
-    `cannot determine model for spawned agent: plugin config has {provider: ${JSON.stringify(provider || null)}, model: ${JSON.stringify(model || null)}}, host default selection has {provider: ${JSON.stringify(def?.provider ?? null)}, model: ${JSON.stringify(def?.model ?? null)}}. `
-    + '请在插件 config 成对配置 provider+model, 或先在 dsh 设置里选择默认模型.',
-  )
+function resolveAgentOptions(ctx: Context, override?: ModelSelectionOverride): ModelSelection {
+  if (!runtimeConfig.allowModelOverride && hasModelOverride(override)) {
+    throw new Error('model override is disabled by plugin config (allowModelOverride: false); '
+      + 'remove provider/model/reasoningEffort from the call, or enable allowModelOverride in cordis.yml')
+  }
+  const cfg = { provider: runtimeConfig.provider, model: runtimeConfig.model }
+  const host = hostDefaultSelection(ctx)
+  const provider = override?.provider || cfg.provider || host?.provider
+  const model = override?.model || cfg.model || host?.model
+  // 推理强度与模型同源: 调用覆盖 > 插件 config > 宿主默认(仅当模型不是被显式钉住时继承)。
+  // 若调用方/插件 profile 已显式钉住 provider+model, 就不继承宿主那个"为别的模型选的"档位——
+  // 宿主对不支持的显式 effort 是直接拒绝(不做 clamp/别名), 继承反而会把能跑的部署弄挂。
+  const pinnedModel = Boolean((override?.provider && override?.model) || (cfg.provider && cfg.model))
+  const reasoningEffort = override?.reasoningEffort
+    ?? (runtimeConfig.reasoningEffort || (pinnedModel ? undefined : host?.reasoningEffort))
+  if (!provider || !model) {
+    throw new Error(
+      `cannot determine model for spawned agent: call override has {provider: ${JSON.stringify(override?.provider ?? null)}, model: ${JSON.stringify(override?.model ?? null)}}, `
+      + `plugin config has {provider: ${JSON.stringify(cfg.provider || null)}, model: ${JSON.stringify(cfg.model || null)}}, `
+      + `host default selection has {provider: ${JSON.stringify(host?.provider ?? null)}, model: ${JSON.stringify(host?.model ?? null)}}. `
+      + '请在调用里成对传 provider+model(先用 model_list 查可用值), 或在插件 config 成对配置, 或先在 dsh 设置里选择默认模型.',
+    )
+  }
+  return reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+}
+
+/** 从 live agent 读它当前实际用的模型选择(接管别人建的会话时回报用; 读不到就留空, 不抛错) */
+function selectionOfAgent(agent: unknown): ModelSelection {
+  const opts = (agent as { options?: { provider?: unknown; model?: unknown; reasoningEffort?: unknown } } | undefined)?.options
+  const s = (v: unknown) => (typeof v === 'string' ? v : '')
+  const provider = s(opts?.provider)
+  const model = s(opts?.model)
+  const reasoningEffort = s(opts?.reasoningEffort)
+  return reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+}
+
+/**
+ * 转成宿主 ctx.agents.create/resume 要的 agentOptions。
+ * reasoningEffort 在宿主侧是 branded 类型(ReasoningEffortId): 值本身是适配器定义的字符串
+ * (来自调用方 / model_list / 适配器默认), 这里只做编译期桥接——零宿主副本原则下不引入宿主的品牌构造函数。
+ */
+function agentOptionsOf(selection: ModelSelection): AgentOptions {
+  const opts: AgentOptions = { provider: selection.provider, model: selection.model }
+  if (selection.reasoningEffort !== undefined) {
+    opts.reasoningEffort = selection.reasoningEffort as unknown as AgentOptions['reasoningEffort']
+  }
+  return opts
 }
 
 /** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名 */
-async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string): Promise<ResolvedAgent> {
+async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string, override?: ModelSelectionOverride): Promise<ResolvedAgent> {
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
-    // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
-    const targetCwd = sessionToCwd.get(sessionId)
-    if (targetCwd !== undefined) {
-      const existing = liveAgents.get(targetCwd)
+    // 先看本进程常驻池(池 key 里含模型, 所以按 sessionId → 池 key 的索引定位; 命中 LRU 移到末尾)
+    const poolKeyOfSession = sessionToPoolKey.get(sessionId)
+    if (poolKeyOfSession !== undefined) {
+      const existing = liveAgents.get(poolKeyOfSession)
       if (existing) {
-        liveAgents.delete(targetCwd)
-        liveAgents.set(targetCwd, existing)
+        liveAgents.delete(poolKeyOfSession)
+        liveAgents.set(poolKeyOfSession, existing)
         return existing
       }
     }
     const sid = asSessionId(sessionId)
-    // 不在常驻池: 看 live(UI 手开的、别的插件持有的会话), 直接接管、不持有 dispose(归其 owner)
+    // 不在常驻池: 看 live(UI 手开的、别的插件持有的会话), 直接接管、不持有 dispose(归其 owner)。
+    // 这条路不解析模型选择: 沿用该会话原有的选择(只给一边 override 时也不改它, 想改请用 select_model)。
     const live = ctx.agents.get(sid)
     if (live) {
       // live 会话也补挂工作区(幂等): 用户手开的会话若尚未归组, 这里一并挂名
       await attachSessionCwd(ctx, sid, live.session.header.cwd)
       // no-op dispose 兜底: executeTask 只在 disposeAfter 为 true 时调用 dispose
-      return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false }
+      return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false, selection: selectionOfAgent(live) }
     }
     // live 也没有: 从持久化会话存储 resume 并接管(进程重启前的会话、LRU 淘汰后被释放的会话)
+    // resume 会重建 agent, 所以这里必须现算一份完整模型选择(agent.options.model 是 {{model}} 变量的来源)
+    const selection = resolveAgentOptions(ctx, override)
     let handle: AgentHandle
     try {
-      // 模型选择: 显式成对配置或经宿主默认选择补全(agent.options.model 是 {{model}} 变量的来源)
       handle = await ctx.agents.resume({
         resumeSessionId: sid,
-        agentOptions: resolveAgentOptions(ctx),
+        agentOptions: agentOptionsOf(selection),
         setup: async (agentCtx) => {
           await mountPreset(ctx, agentCtx)
         },
@@ -306,13 +421,16 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       throw new Error(`session not found for resume: ${sessionId} (not live and not persisted; ${(e as Error)?.message ?? e})`)
     }
     await attachSessionCwd(ctx, sid, handle.agent.session.header.cwd)
-    return { sessionId: sid, handle, disposeAfter: true }
+    return { sessionId: sid, handle, disposeAfter: true, selection }
   }
-  const existing = liveAgents.get(cwd)
+  // 无 sessionId: 按 cwd + 模型三元组命中/新建常驻会话(不同模型 = 不同会话, 上下文不串联)
+  const selection = resolveAgentOptions(ctx, override)
+  const key = poolKey(cwd, selection)
+  const existing = liveAgents.get(key)
   if (existing) {
     // LRU: 命中则移到末尾(最近使用)
-    liveAgents.delete(cwd)
-    liveAgents.set(cwd, existing)
+    liveAgents.delete(key)
+    liveAgents.set(key, existing)
     // 自愈: 幂等补挂(已在花名册则 no-op; 首次挂名失败的池会话在此被捞回)
     await attachToWorkspace(ctx, await canonicalCwd(cwd), existing.sessionId)
     return existing
@@ -324,7 +442,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     const old = liveAgents.get(oldestKey)
     liveAgents.delete(oldestKey)
     if (old) {
-      sessionToCwd.delete(String(old.sessionId))
+      sessionToPoolKey.delete(String(old.sessionId))
       try { void (old.handle as { dispose?: () => Promise<void> } | undefined)?.dispose?.() } catch { /* 忽略 */ }
     }
   }
@@ -336,15 +454,15 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     sessionId: newSessionId,
     // 声明 preset: 当前版本主要靠 setup 里 mount, meta.agentPreset 供未来 Harness 版本直接消费。
     meta: { cwd: canonical, agentPreset: runtimeConfig.preset },
-    // 模型选择: 显式成对配置或经宿主默认选择补全(agent.options.model 是 {{model}} 变量的来源)
-    agentOptions: resolveAgentOptions(ctx),
+    // 模型选择: 调用覆盖 / 插件 config / 宿主默认补全后的完整选择(agent.options.model 是 {{model}} 变量的来源)
+    agentOptions: agentOptionsOf(selection),
     setup: async (agentCtx) => {
       await mountPreset(ctx, agentCtx)
     },
   })
-  const rec = { sessionId: newSessionId, handle }
-  liveAgents.set(cwd, rec)
-  sessionToCwd.set(String(newSessionId), cwd)
+  const rec: PooledAgent = { sessionId: newSessionId, handle, cwd, selection }
+  liveAgents.set(key, rec)
+  sessionToPoolKey.set(String(newSessionId), key)
 
   // 分组: 把会话归属到 cwd 对应的工作区(resolveByPath ?? create + attachSession; 可选依赖; headless 环境自动跳过)
   void (async () => {
@@ -384,6 +502,8 @@ async function withLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
 interface TaskResult {
   taskId: string
   sessionId: string
+  /** 本次执行实际用的模型选择(接管会话读不到 options 时字段为空; 让调用方知道是谁答的) */
+  model: ModelSelection
   assistantText: string
   toolCalls: { name: string; args: string }[]
   toolResults: string[]
@@ -463,6 +583,15 @@ const DETAIL_ARG = {
   full: 'full: 完整原文(最坏数万 token, 仅排查用)',
 } as const
 
+/** 结果里的模型回报: 只保留有值的字段(接管别人建的会话、读不到 options 时为空对象) */
+function projectModel(selection: ModelSelectionOverride | undefined): Record<string, string> {
+  const o: Record<string, string> = {}
+  if (selection?.provider) o.provider = selection.provider
+  if (selection?.model) o.model = selection.model
+  if (selection?.reasoningEffort) o.reasoningEffort = selection.reasoningEffort
+  return o
+}
+
 /** 读时投影: 把全量 TaskResult 渲染成对应 detail 级别的返回载荷 */
 function renderResult(result: TaskResult, detail: DetailLevel): Record<string, unknown> {
   const caps = DETAIL_CAPS[detail]
@@ -470,6 +599,7 @@ function renderResult(result: TaskResult, detail: DetailLevel): Record<string, u
     detail,
     taskId: result.taskId,
     sessionId: result.sessionId,
+    model: projectModel(result.model),
     toolCallCount: result.toolCalls.length,
     toolResultCount: result.toolResults.length,
     error: clip(result.error, caps.error),
@@ -502,7 +632,7 @@ function renderResult(result: TaskResult, detail: DetailLevel): Record<string, u
 }
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string): Promise<TaskResult> {
+async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string, override?: ModelSelectionOverride): Promise<TaskResult> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
@@ -516,7 +646,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
   // sessionId 用 session 锁, 否则用 cwd 锁——都防同一 agent 会话被并发 followup
   const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
   return withLock(lockKey, async () => {
-    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title)
+    const { sessionId, handle, disposeAfter, selection } = await getAgent(ctx, workdir, resumeSessionId, title, override)
     // 事件基线: 只读本轮新增事件(公开 API snapshotEvents; 旧宿主回退 log 字段)
     const baseline = eventsOf(handle.agent.session).length
 
@@ -533,7 +663,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
 
     // 结构化读输出
     const result: TaskResult = {
-      taskId: '', sessionId, assistantText: '', toolCalls: [], toolResults: [],
+      taskId: '', sessionId, model: selection, assistantText: '', toolCalls: [], toolResults: [],
       changes: '', verification: '', leftovers: '', error: '',
     }
     let observedEvents = 0
@@ -633,6 +763,10 @@ interface TaskItem {
   cwd: string
   sessionId?: string
   title?: string
+  /** 单次调用的模型覆盖(入队后异步执行时才解析成完整选择) */
+  provider?: string
+  model?: string
+  reasoningEffort?: string
   status: 'queued' | 'running' | 'done' | 'error'
   result?: TaskResult
   error?: string
@@ -707,6 +841,141 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   return { attached, failed }
 }
 
+// ── 模型目录(model_list)与池维护(select_model) ──
+
+/**
+ * sessionController 视图(web profile 提供; 可选依赖): 官方模型目录 + "切换会话模型"入口。
+ * 官方 UI 的模型选择器走的就是这两个方法, 所以插件不自己维护 provider/模型清单。
+ */
+interface SessionControllerView {
+  modelCatalog?: () => Promise<ModelCatalogView>
+  selectModel?: (
+    request: { sessionId: SessionId; provider: string; model: string; reasoningEffort?: string },
+  ) => Promise<{ selected?: ModelSelection } | undefined>
+}
+
+/** 官方模型目录形状(只声明本插件读的字段; 未声明的一律不碰) */
+interface ModelCatalogView {
+  default?: ModelSelection
+  routableProviders?: readonly string[]
+  groups?: readonly ModelCatalogGroupView[]
+  failures?: readonly { id?: string; name?: string; message?: string }[]
+}
+interface ModelCatalogGroupView {
+  id?: string
+  name?: string
+  models?: readonly {
+    id?: string
+    name?: string
+    reasoning?: { efforts?: readonly { id?: string; name?: string }[]; defaultEffort?: string }
+  }[]
+}
+
+/** llm 服务视图(sessionController 缺席时的目录回退; llm 是核心服务, 但最小假 ctx 里可能只有空对象) */
+interface LlmView {
+  listProviders?: () => readonly { id?: string; name?: string }[]
+  listModels?: (provider: string) => Promise<readonly { id?: string; name?: string }[]>
+}
+
+/** 目录里的模型投影: 只留 id/name + 推理档(选 reasoningEffort 要用), 丢掉 description 等长字段省上下文 */
+function projectCatalogModel(m: { id?: string; name?: string; reasoning?: { efforts?: readonly { id?: string; name?: string }[]; defaultEffort?: string } }): Record<string, unknown> {
+  const id = m.id ?? ''
+  const out: Record<string, unknown> = { id, name: m.name ?? id }
+  const efforts = (m.reasoning?.efforts ?? []).map((e) => ({ id: e.id ?? '', name: e.name ?? e.id ?? '' }))
+  if (efforts.length) out.reasoningEfforts = efforts
+  if (m.reasoning?.defaultEffort) out.defaultReasoningEffort = m.reasoning.defaultEffort
+  return out
+}
+
+/**
+ * 收集当前可路由的模型目录。两个来源:
+ *   1. sessionController.modelCatalog() —— 官方口径(含 default / routableProviders / 各 provider 的加载失败),
+ *      与 Web UI 模型选择器同一数据源;
+ *   2. 回退: llm.listProviders() + 逐个 listModels() —— 只服务会话控制器缺席的部署(如 headless),
+ *      逐个 provider 隔离失败, 且不含推理档元数据(那需要 resolveModelInfo, 这里不逐模型发请求)。
+ * 同时回报插件自身的模型配置与 allowModelOverride, 让调用方知道"能不能自己选"。
+ */
+async function collectModelCatalog(ctx: Context, only?: string): Promise<Record<string, unknown>> {
+  const failures: { id: string; name?: string; message: string }[] = []
+  let source = 'none'
+  let groups: { id: string; name: string; models: Record<string, unknown>[] }[] = []
+  let routable: string[] = []
+  let def: ModelSelectionOverride | undefined
+
+  const sc = serviceOf<SessionControllerView>(ctx, 'sessionController')
+  if (typeof sc?.modelCatalog === 'function') {
+    try {
+      const cat = await sc.modelCatalog()
+      source = 'sessionController'
+      def = cat.default
+      routable = [...(cat.routableProviders ?? [])]
+      groups = (cat.groups ?? []).map((g) => {
+        const id = g.id ?? ''
+        return { id, name: g.name ?? id, models: (g.models ?? []).map(projectCatalogModel) }
+      })
+      for (const f of cat.failures ?? []) {
+        failures.push({ id: f.id ?? '', ...(f.name ? { name: f.name } : {}), message: f.message ?? 'unknown failure' })
+      }
+    } catch (e) {
+      failures.push({ id: 'sessionController', message: String((e as Error)?.message ?? e) })
+    }
+  }
+
+  const llm = serviceOf<LlmView>(ctx, 'llm')
+  if (source !== 'sessionController' && typeof llm?.listProviders === 'function') {
+    source = 'llm'
+    const providers = llm.listProviders()
+    routable = providers.map((p) => p.id ?? '').filter(Boolean)
+    groups = await Promise.all(routable.map(async (id) => {
+      const name = providers.find((p) => (p.id ?? '') === id)?.name ?? id
+      try {
+        const models = typeof llm.listModels === 'function' ? await llm.listModels(id) : []
+        return { id, name, models: models.map((m) => projectCatalogModel(m)) }
+      } catch (e) {
+        failures.push({ id, name, message: String((e as Error)?.message ?? e) })
+        return { id, name, models: [] }
+      }
+    }))
+  }
+
+  // 缺省选择: 官方目录优先, 其次宿主默认选择(agentDefaultModel)
+  if (def === undefined) def = hostDefaultSelection(ctx)
+  const q = only?.trim()
+  const filtered = q ? groups.filter((g) => g.id === q) : groups
+  return {
+    source,
+    default: projectModel(def),
+    routableProviders: q ? routable.filter((p) => p === q) : routable,
+    providers: filtered,
+    ...(failures.length ? { failures } : {}),
+    config: {
+      provider: runtimeConfig.provider || null,
+      model: runtimeConfig.model || null,
+      reasoningEffort: runtimeConfig.reasoningEffort || null,
+      allowModelOverride: runtimeConfig.allowModelOverride,
+    },
+  }
+}
+
+/**
+ * 会话模型切换后的池维护: 池 key 含模型三元组, 模型变了就要把该会话挪到新 key 下。
+ * 目标 key 已被同 cwd 的另一个会话占用时不再入池(避免顶掉别人的默认会话): 该会话仍可按
+ * sessionId 接管(ctx.agents.get), 只是不再是"该 cwd + 该模型"的默认池会话。
+ */
+function rekeyPooledSession(sessionId: string, next: ModelSelection): void {
+  const key = sessionToPoolKey.get(sessionId)
+  if (key === undefined) return
+  const rec = liveAgents.get(key)
+  sessionToPoolKey.delete(sessionId)
+  if (rec === undefined) return
+  liveAgents.delete(key)
+  const nextKey = poolKey(rec.cwd, next)
+  if (liveAgents.has(nextKey)) return
+  rec.selection = next
+  liveAgents.set(nextKey, rec)
+  sessionToPoolKey.set(sessionId, nextKey)
+}
+
 // ── MCP 工具注册 ──
 
 /** 在给定 McpServer 上注册工具 */
@@ -736,10 +1005,20 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
+  // 模型目录: 选模型前先查这里(provider route / 模型 id / 推理档 / 缺省选择)
+  mcp.tool(
+    'model_list',
+    '列出当前可路由的 provider、模型 id 与推理档(reasoningEfforts), 以及缺省模型选择。agent_run/task_inbox 的 provider/model/reasoningEffort 与 select_model 都取自这里。source=sessionController 为官方口径(与 Web UI 模型选择器同源); source=llm 为回退(不含推理档)。',
+    {
+      provider: z.string().optional().describe('只看某个 provider route(缺省: 全部)'),
+    },
+    async ({ provider }) => out(JSON.stringify(await collectModelCatalog(ctx, provider), null, 2)),
+  )
+
   // 同步执行任务(简单场景: 调用方下发 → 立即拿结果)
   mcp.tool(
     'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。默认返回 summary 级(省上下文), 需要 toolCalls 原文时传 detail=full。',
+    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。可用 provider/model/reasoningEffort 指定本次模型(见 model_list; 同 cwd 下不同模型各自一个常驻会话)。默认返回 summary 级(省上下文), 需要 toolCalls 原文时传 detail=full。',
     {
       task: z.string().describe('要 Harness 执行的自然语言任务'),
       context: z.string().optional().describe('调用方记忆/上下文, 注入给 agent 参考(续接同一 sessionId 时建议只发增量)'),
@@ -747,9 +1026,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
       title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
       detail: z.enum(['summary', 'normal', 'full']).optional().describe(`结果详略: ${DETAIL_ARG.summary}; ${DETAIL_ARG.normal}; ${DETAIL_ARG.full}`),
+      provider: z.string().optional().describe('模型 provider route(见 model_list; 需与 model 成对; 缺省走插件配置/宿主默认)'),
+      model: z.string().optional().describe('模型 id(见 model_list; 需与 provider 成对; 缺省走插件配置/宿主默认)'),
+      reasoningEffort: z.string().optional().describe('推理强度 id(见 model_list 的 reasoningEfforts; 缺省 = 适配器默认)'),
     },
-    async ({ task, context, cwd, sessionId, title, detail }) => {
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
+    async ({ task, context, cwd, sessionId, title, detail, provider, model, reasoningEffort }) => {
+      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, selectionOverrideOf({ provider, model, reasoningEffort }))
       return out(JSON.stringify(renderResult(result, detail ?? runtimeConfig.defaultDetail), null, 2))
     },
   )
@@ -757,15 +1039,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 异步 push 任务到队列(调用方 → dsh 任务入口)
   mcp.tool(
     'task_inbox',
-    '把结构化任务(任务+上下文)推入 dsh 队列, 异步执行, 返回 taskId。',
+    '把结构化任务(任务+上下文)推入 dsh 队列, 异步执行, 返回 taskId。可用 provider/model/reasoningEffort 指定本次模型(见 model_list)。',
     {
       task: z.string().describe('任务内容'),
       context: z.string().optional().describe('调用方记忆/上下文, 随任务注入给 agent'),
       cwd: z.string().optional().describe('工作目录'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
       title: z.string().optional().describe('新会话的标题(创建时命名)'),
+      provider: z.string().optional().describe('模型 provider route(见 model_list; 需与 model 成对)'),
+      model: z.string().optional().describe('模型 id(见 model_list; 需与 provider 成对)'),
+      reasoningEffort: z.string().optional().describe('推理强度 id(见 model_list 的 reasoningEfforts)'),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
+    async ({ task, context, cwd, sessionId, title, provider, model, reasoningEffort }) => {
       const now = Date.now()
       // TTL 清理: 删除已完成/失败且超时的任务
       for (const [tid, t] of taskQueue) {
@@ -784,13 +1069,16 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
         ...(sessionId ? { sessionId } : {}),
         ...(title ? { title } : {}),
+        ...(provider ? { provider } : {}),
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞调用方)
       void (async () => {
         item.status = 'running'
         try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
+          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, selectionOverrideOf(item))
           item.result.taskId = id
           item.status = 'done'
         } catch (e) {
@@ -823,6 +1111,40 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }))
       }
       return out(JSON.stringify(renderResult(item.result, detail ?? runtimeConfig.defaultDetail), null, 2))
+    },
+  )
+
+  // 会话内换模型(官方 selectModel 路径: 校验 + 持久通知, 下一个 step 生效; 历史不丢)
+  mcp.tool(
+    'select_model',
+    '切换一个已存在会话使用的模型(走官方 sessionController.selectModel: 校验后写一条持久通知, 在下一个 step 生效, 对话历史保留)。需要 web profile 的 sessionController; 不可用时改用 agent_run 的 provider/model 参数。',
+    {
+      sessionId: z.string().describe('要换模型的会话 id'),
+      provider: z.string().describe('目标 provider route(见 model_list)'),
+      model: z.string().describe('目标模型 id(见 model_list)'),
+      reasoningEffort: z.string().optional().describe('推理强度 id(见 model_list 的 reasoningEfforts; 缺省 = 适配器默认)'),
+    },
+    async ({ sessionId, provider, model, reasoningEffort }) => {
+      if (!runtimeConfig.allowModelOverride) {
+        return out(JSON.stringify({ error: 'model override is disabled by plugin config (allowModelOverride: false)' }))
+      }
+      const sc = serviceOf<SessionControllerView>(ctx, 'sessionController')
+      if (typeof sc?.selectModel !== 'function') {
+        return out(JSON.stringify({
+          error: 'sessionController service unavailable (select_model needs the web profile session controller); '
+            + 'use agent_run with provider/model to run on another model instead',
+        }))
+      }
+      try {
+        const requested: ModelSelection = reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+        const res = await sc.selectModel({ sessionId: asSessionId(sessionId), ...requested })
+        const selected = res?.selected ?? requested
+        // 池 key 含模型: 切完要把该会话挪到新 key 下, 否则下次同模型调用会误开一个新会话
+        rekeyPooledSession(sessionId, selected)
+        return out(JSON.stringify({ ok: true, sessionId, selected: projectModel(selected) }))
+      } catch (e) {
+        return out(JSON.stringify({ error: `select_model failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
     },
   )
 
@@ -883,6 +1205,77 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   )
 }
 
+// ── GUI 控制面（webServer 路由） ──
+
+/** webServer 服务视图(web profile 提供; 可选依赖): GUI 同源 HTTP 路由, 形态对齐 dsh-bottom-info-bar */
+interface WebServerView {
+  register(options: {
+    kind: 'prefix'
+    path: string
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>
+  }): () => void
+}
+
+/** 一条 MCP 客户端连接(transport 会话)的观测记录: 面板与 status RPC 的数据源 */
+interface McpConnection {
+  sessionId: string
+  connectedAt: number
+  lastActivity: number
+  userAgent: string
+  requests: number
+}
+
+/** GUI 路由前缀: /_dsh/dsh-ops-mcp/<method>, 与 bottom-info-bar 同约定 */
+const WEB_ROUTE_PREFIX = '/_dsh/dsh-ops-mcp'
+
+/** JSON 响应(GUI 路由) */
+function webRespond(res: http.ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
+
+/** 变更类 GUI 路由的同源校验(sec-fetch-site / origin 对 host; curl 等无 Origin 客户端放行读) */
+function sameOrigin(req: http.IncomingMessage): boolean {
+  const fetchSite = req.headers['sec-fetch-site']
+  if (fetchSite === 'cross-site') return false
+  const origin = req.headers.origin
+  if (origin === undefined) return fetchSite === 'same-origin' || fetchSite === 'same-site'
+  const host = req.headers.host
+  if (host === undefined) return false
+  try {
+    const parsed = new URL(origin)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
+  } catch {
+    return false
+  }
+}
+
+/** 读 GUI 路由请求体(限字节; 超限 413) */
+function webReadBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        const err = new Error('body too large') as Error & { status?: number }
+        err.status = 413
+        reject(err)
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
 // ── HTTP 层(认证 / Host 校验 / 路由) ──
 
 /** JSON-RPC 错误响应体 */
@@ -916,6 +1309,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   runtimeConfig = {
     provider: config.provider ?? DEFAULTS.provider,
     model: config.model ?? DEFAULTS.model,
+    reasoningEffort: config.reasoningEffort ?? DEFAULTS.reasoningEffort,
+    allowModelOverride: config.allowModelOverride ?? DEFAULTS.allowModelOverride,
     preset: config.preset ?? DEFAULTS.preset,
     maxQueue: config.maxQueue ?? DEFAULTS.maxQueue,
     taskTtlMs: config.taskTtlMs ?? DEFAULTS.taskTtlMs,
@@ -953,22 +1348,163 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   ctx.effect(() => {
     return () => {
       liveAgents.clear()
-      sessionToCwd.clear()
+      sessionToPoolKey.clear()
       agentLocks.clear()
       taskQueue.clear()
     }
   }, 'dsh-ops-mcp')
 
-  // http: false 显式关闭监听(仅保留上面的生命周期钩子)
+  // ── MCP server 观测与软停启(http:false 时仅保留 GUI 控制面) ──
+  const startedAt = Date.now()
+  /** MCP 连接登记(sessionId → 观测记录); GUI 面板与 status RPC 的数据源, apply 级生命周期 */
+  const connections = new Map<string, McpConnection>()
+  const servers = new Map<string, McpServer>()
+  const transports = new Map<string, StreamableHTTPServerTransport>()
+  let server: http.Server | undefined
+  let listening = false
+
+  /** 监听一次(可重复调用): 端口被占/EADDRNOTAVAIL 时抛错, 调用方决定是否致命 */
+  const listenOnce = () => new Promise<void>((resolveListen, rejectListen) => {
+    const s = server
+    if (s === undefined) {
+      rejectListen(new Error('server not created (http disabled?)'))
+      return
+    }
+    const onListenError = (e: Error) => {
+      s.off('listening', onListening)
+      rejectListen(new Error(`cannot listen on ${host}:${port}: ${e.message}`))
+    }
+    const onListening = () => {
+      s.off('error', onListenError)
+      resolveListen()
+    }
+    s.once('error', onListenError)
+    s.once('listening', onListening)
+    s.listen(port, host)
+  })
+
+  /** 状态快照: 版本/监听/配置摘要/运行指标/活跃连接(GUI 面板与 status RPC 同一数据源) */
+  const statusSnapshot = () => {
+    let queueActive = 0
+    let queueDone = 0
+    let queueError = 0
+    for (const t of taskQueue.values()) {
+      if (t.status === 'queued' || t.status === 'running') queueActive++
+      else if (t.status === 'done') queueDone++
+      else queueError++
+    }
+    return {
+      name,
+      version: PLUGIN_VERSION,
+      listening,
+      httpEnabled: config.http !== false,
+      endpoint: `http://${host}:${port}/mcp`,
+      startedAt,
+      uptimeMs: Date.now() - startedAt,
+      config: {
+        provider: runtimeConfig.provider || '(跟随宿主默认)',
+        model: runtimeConfig.model || '(跟随宿主默认)',
+        reasoningEffort: runtimeConfig.reasoningEffort || '(适配器默认)',
+        allowModelOverride: runtimeConfig.allowModelOverride,
+        preset: runtimeConfig.preset,
+        defaultDetail: runtimeConfig.defaultDetail,
+        maxAgents: runtimeConfig.maxAgents,
+        maxQueue: runtimeConfig.maxQueue,
+        authEnabled: runtimeConfig.authToken !== '',
+        workspaceRoots: runtimeConfig.workspaceRoots,
+      },
+      stats: {
+        liveAgents: liveAgents.size,
+        queue: { active: queueActive, done: queueDone, error: queueError },
+        connections: connections.size,
+      },
+      connections: Array.from(connections.values(), (c) => ({ ...c })),
+    }
+  }
+
+  /** 软停止: 关监听 + 切断全部连接/transport。不卸载插件行——GUI 控制面(3080)仍在, 可再启动 */
+  async function stopMcpServer(): Promise<{ stopped: boolean }> {
+    const s = server
+    if (s === undefined || !listening) return { stopped: true }
+    listening = false
+    s.close()
+    // 同步切断遗留 keep-alive/SSE 连接, 端口释放不依赖对端空闲超时
+    s.closeAllConnections?.()
+    for (const transport of transports.values()) {
+      try { void transport.close() } catch { /* 尽力清理 */ }
+    }
+    transports.clear()
+    servers.clear()
+    connections.clear()
+    console.log(`[dsh-ops-mcp] MCP server stopped (soft stop, ${host}:${port})`)
+    return { stopped: true }
+  }
+
+  /** 软启动: 重新监听同端口(端口被占时返回错误而不抛) */
+  async function startMcpServer(): Promise<{ started: boolean; error?: string }> {
+    if (config.http === false) return { started: false, error: 'http disabled by config' }
+    if (listening) return { started: true }
+    try {
+      await listenOnce()
+      listening = true
+      console.log(`[dsh-ops-mcp] MCP server listening on ${host}:${port}/mcp (soft start)`)
+      return { started: true }
+    } catch (e) {
+      return { started: false, error: (e as Error)?.message ?? String(e) }
+    }
+  }
+
+  // ── GUI 控制面: webServer 路由 /_dsh/dsh-ops-mcp/<method>(设置页面板的数据/操作后端) ──
+  const WEB_ROUTES: Record<string, () => unknown> = {
+    status: () => statusSnapshot(),
+    stop: () => stopMcpServer(),
+    start: () => startMcpServer(),
+  }
+  const WEB_MUTATING = new Set(['stop', 'start'])
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = (webCtx as unknown as { webServer: WebServerView }).webServer
+    webCtx.effect(() => {
+      const dispose = webServer.register({
+        kind: 'prefix',
+        path: WEB_ROUTE_PREFIX,
+        handler: async (req: http.IncomingMessage, res: http.ServerResponse) => {
+          try {
+            const path = new URL(req.url ?? '/', 'http://localhost').pathname
+            if (!path.startsWith(`${WEB_ROUTE_PREFIX}/`)) {
+              webRespond(res, 404, { error: 'not found' })
+              return
+            }
+            const method = decodeURIComponent(path.slice(WEB_ROUTE_PREFIX.length + 1))
+            const fn = Object.hasOwn(WEB_ROUTES, method) ? WEB_ROUTES[method] : undefined
+            if (typeof fn !== 'function') {
+              webRespond(res, 404, { error: `unknown method: ${method}` })
+              return
+            }
+            // 变更类方法要求同源(GUI 按钮发起; 防 CSRF 式启停)
+            if (WEB_MUTATING.has(method) && !sameOrigin(req)) {
+              webRespond(res, 403, { error: 'cross-origin request rejected' })
+              return
+            }
+            // 读 body(仅为了消费流, 方法本身无参; 限 64k 防滥用)
+            if (req.method === 'POST' || req.method === 'PUT') await webReadBody(req, 64 * 1024)
+            webRespond(res, 200, await fn())
+          } catch (e) {
+            const status = (e as { status?: number })?.status ?? 500
+            webRespond(res, status, { error: status === 500 ? 'internal error' : String((e as Error)?.message ?? e) })
+          }
+        },
+      })
+      return () => { dispose() }
+    }, 'dsh-ops-mcp: web routes')
+  })
+
+  // http: false 显式关闭 MCP 监听(GUI 控制面仍可用: 面板显示"未监听", 可看配置但不可启动)
   if (config.http === false) {
-    console.log('[dsh-ops-mcp] http disabled by config, MCP server not started')
+    console.log('[dsh-ops-mcp] http disabled by config, MCP server not started (web panel still available)')
     return
   }
 
-  const servers = new Map<string, McpServer>()
-  const transports = new Map<string, StreamableHTTPServerTransport>()
-
-  const server = http.createServer(async (req, res) => {
+  server = http.createServer(async (req, res) => {
     // Bearer token 认证(配置了 authToken 时强制所有请求校验, 常数时间比较)
     if (!bearerOk(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
@@ -996,6 +1532,16 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
 
     const sessionId = (req.headers['mcp-session-id'] as string | undefined) ?? undefined
+    // 连接观测: 每个带会话头的请求都记一次活跃(连接身份以 User-Agent 识别)
+    if (sessionId) {
+      const c = connections.get(sessionId)
+      if (c) {
+        c.lastActivity = Date.now()
+        c.requests++
+        const ua = String(req.headers['user-agent'] ?? '')
+        if (ua && !c.userAgent) c.userAgent = ua
+      }
+    }
     const existing = sessionId ? transports.get(sessionId) : undefined
 
     // 已有 session: GET/POST/DELETE 都路由到对应 transport(支持 SSE 流 + 会话终止)
@@ -1013,11 +1559,20 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (req.method === 'POST' && !sessionId) {
       const mcp = new McpServer({ name, version: PLUGIN_VERSION })
       registerTools(mcp, ctx)
+      const initUserAgent = String(req.headers['user-agent'] ?? '')
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           transports.set(sid, transport)
           servers.set(sid, mcp)
+          // 连接登记: 首个 initialize 请求的 User-Agent 即客户端身份
+          connections.set(sid, {
+            sessionId: sid,
+            connectedAt: Date.now(),
+            lastActivity: Date.now(),
+            userAgent: initUserAgent,
+            requests: 1,
+          })
         },
       })
       // 会话关闭时清理映射(避免临时 key 泄漏 + 无效会话累积)
@@ -1026,6 +1581,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         if (sid) {
           transports.delete(sid)
           servers.delete(sid)
+          connections.delete(sid)
         }
       }
       await mcp.connect(transport as never)
@@ -1046,34 +1602,27 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   })
 
   // 等待 listen 完成: 端口被占/EADDRNOTAVAIL 时 apply 直接抛错, 插件启动失败可见(不再静默成功)
-  await new Promise<void>((resolveListen, rejectListen) => {
-    const onListenError = (e: Error) => {
-      server.off('listening', onListening)
-      rejectListen(new Error(`cannot listen on ${host}:${port}: ${e.message}`))
-    }
-    const onListening = () => {
-      server.off('error', onListenError)
-      resolveListen()
-    }
-    server.once('error', onListenError)
-    server.once('listening', onListening)
-    server.listen(port, host)
-  })
+  await listenOnce()
+  listening = true
   console.log(`[dsh-ops-mcp] MCP server listening on ${host}:${port}/mcp`)
   // 运行期错误(如 socket 异常)记日志不崩进程
   server.on('error', (e) => {
     console.error('[dsh-ops-mcp] HTTP server error:', e.message)
   })
 
-  // 卸载时关 server + 清空 transport/server 映射(与上面的池/队列清理同属一个 effect 链)
+  // 卸载时关 server + 清空 transport/server/连接映射(与上面的池/队列清理同属一个 effect 链)
   ctx.effect(() => {
     return () => {
-      server.close()
+      server?.close()
+      // 热重载确定性: HMR 换新实例卸旧 fiber 时同步切断遗留 keep-alive/SSE 连接,
+      // 8090 的释放不依赖对端空闲超时; 进行中的请求被 reset(dev 形态可接受)
+      server?.closeAllConnections?.()
       for (const transport of transports.values()) {
         try { void transport.close() } catch { /* 尽力清理 */ }
       }
       transports.clear()
       servers.clear()
+      connections.clear()
     }
   }, 'dsh-ops-mcp')
 }

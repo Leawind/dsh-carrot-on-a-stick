@@ -4,6 +4,8 @@ import { apply } from './lib/index.js'
 
 const ctx = {
   effect: (fn) => fn(),
+  // 依赖注入桩: 假 ctx 不是真 cordis(webServer 类可选依赖不出现)
+  inject: () => undefined,
   get: () => undefined,
 }
 
