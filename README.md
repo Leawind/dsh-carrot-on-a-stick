@@ -28,7 +28,7 @@ dsh agent — full toolset: bash, fs, todo, web…
 | Tool | Purpose |
 |---|---|
 | `echo` | connectivity check |
-| `dsh_list_tools` | list tool names registered in dsh |
+| `dsh_list_tools` | list tools registered in dsh (name + description) |
 | `agent_run` | run a task synchronously, structured result; pass `sessionId` to continue a session |
 | `task_inbox` | push a structured task (task + context + cwd) into the async queue, returns `taskId` |
 | `task_result` | fetch the structured result of a queued task |
@@ -90,27 +90,42 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
         http: true
         port: 8090
         host: 127.0.0.1        # localhost only by default; add auth before exposing
-        # authToken: 'your-secret-token'   # Bearer token auth
-        # workspaceRoots: ['/workspace']   # cwd whitelist
+        # authToken: 'your-secret-token'   # Bearer token auth (constant-time compare)
+        # workspaceRoots: ['/workspace']   # cwd whitelist (separator/case-safe cross-platform)
+        # allowedHosts: ['my-box.lan']     # extra allowed Host header values (DNS-rebinding guard)
         # preset: 'standard'               # agent preset to mount
         # model: ''                        # empty = follow dsh user/default settings
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `host` / `port` | `127.0.0.1` / `8090` | MCP server bind address |
-| `authToken` | — | Bearer token; enforced on every request when set |
-| `workspaceRoots` | — | cwd whitelist |
+| `host` / `port` | `127.0.0.1` / `8090` | MCP server bind address; a listen failure (port in use, …) fails plugin startup loudly |
+| `authToken` | — | Bearer token; enforced on every request when set (constant-time compare) |
+| `workspaceRoots` | — | cwd whitelist; agents may only work inside the listed directories (subdirs included) |
+| `allowedHosts` | — | extra allowed Host-header values; the bind host and loopback aliases are always allowed, everything else gets 403 |
 | `provider` / `model` / `preset` | `deepseek-official` / follow user settings / `standard` | spawned-agent configuration |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
+
+## Zero host copies
+
+The plugin has **zero runtime dependencies on `@deepseek-ai/*`**: every dsh capability is reached
+through injected host services (`ctx.agents` / `ctx.tools` / `ctx.agentPresets` …), types only
+augment the compiler via `import type` (erased at build), and `@deepseek-ai/*` packages are
+devDependencies. A plugin therefore can never drag a mismatched copy of a host package into the
+process — the root cause behind the upstream-era `scopeOf` symbol mismatch that silently left
+agents tool-less. Event reads go through the public `session.snapshotEvents()` API and message
+construction uses a local, field-for-field equivalent of the host's `createUserMessage`.
 
 ## Security
 
 ⚠️ This plugin exposes **local execution capability** (equivalent to RCE). It binds `127.0.0.1` only by default. When enabling:
 
-1. Set `authToken` — against other local processes and DNS-rebinding attacks;
+1. Set `authToken` — against other local processes and DNS-rebinding attacks (constant-time compare);
 2. Set `workspaceRoots` — constrain where agents may work;
 3. Never bind `0.0.0.0` or expose to LAN/WAN without a reverse proxy + TLS + auth.
+
+Built-in guards: a Host-header allowlist (bind host + loopback aliases by default, guarding against
+DNS rebinding; a missing Host header gets 400) and a `/mcp`-only HTTP surface (everything else 404).
 
 ## Provenance
 
@@ -120,23 +135,30 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 - tracks current dsh releases (see Roadmap);
 - independent name and repository: `dsh-ops-mcp`.
 
-## Roadmap / known issues (against dsh 0.1.5-rc.2)
+## Roadmap / known limitations (against dsh 0.1.5-rc.2)
 
-- [ ] `@deepseek-ai/dsh-*` deps still pinned to the 0.1.0-rc.x era: when mixed with 0.1.5-rc.2, the module-private `Symbol()` inside `scopeOf` mismatches and preset mounting gets skipped (tool-less agents). Remove the scope pre-check (let `mount` validate) or detect from the host side.
-- [ ] `ctx.tools.keys()` no longer exists in 0.1.5 → `dsh_list_tools` returns `[]`; switch to `ctx.tools.schemas()`.
-- [ ] `sessionPersistence.list()` now returns `SessionPersistenceSnapshot[]` (header under `.header`).
-- [ ] `workspaceRegistry`'s `attachSession` surface needs re-verification.
-- [ ] On Windows, `workspaceRoots` subdirectory matching breaks on path separators (`startsWith(root + '/')` vs backslashes).
-- [ ] `apply()` does not await `listen`; a port conflict fails silently.
+The compatibility issues listed in the 0.2.0 roadmap were all fixed in **0.3.0** (see
+[CHANGELOG](./CHANGELOG.md)): the `scopeOf` pre-check removal, `dsh_list_tools` switching to
+`schemas()`, the persistence-snapshot `.header` compat, `workspaceRegistry.attachSession`
+re-verification (still the official pattern), the Windows whitelist separator fix, and `apply()`
+awaiting `listen`.
+
+What remains:
+
+- [ ] The task queue lives in process memory; a restart loses it (persistence is future work).
+- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox`; callers should bring their own MCP-level timeout.
+- [ ] Tool calls inside spawned sessions go through the host approval policy (with `ask` they pop a dialog or fail closed).
+- [ ] No end-to-end verification against a live `dsh web --patch` yet (current verification = host-interface audit + fake-ctx smoke).
+- [ ] When dsh releases new versions, the `@deepseek-ai/*` devDependencies need syncing (compile-time only; the zero-runtime-dependency design is unaffected).
 
 ## Development
 
 ```bash
 npm install
-npm run smoke    # minimal smoke test on port 8099 (fake ctx + real MCP protocol round-trips)
+npm run build    # standalone build (plain tsc) -> lib/
+npm run smoke    # smoke tests on ports 8099/8098 (fake ctx + real MCP protocol round-trips, 24 checks)
+                 # + a port-conflict case (apply must fail loudly)
 ```
-
-Building the full artifacts currently requires the deepseek-harness repo tree (inherited `tsconfig.json` relative references); standalone build is planned.
 
 ## License
 

@@ -28,7 +28,7 @@ dsh agent —— 完整工具集：bash、fs、todo、web…
 | 工具 | 用途 |
 |---|---|
 | `echo` | 验证 MCP 连通性 |
-| `dsh_list_tools` | 列出 dsh 当前注册的工具名 |
+| `dsh_list_tools` | 列出 dsh 当前注册的工具（name + description） |
 | `agent_run` | 同步执行任务，返回结构化结果；可传 `sessionId` 续接已有会话 |
 | `task_inbox` | 把结构化任务（任务+上下文+cwd）推入异步队列，返回 `taskId` |
 | `task_result` | 取回队列任务的结构化结果 |
@@ -90,27 +90,42 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
         http: true
         port: 8090
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
-        # authToken: 'your-secret-token'   # Bearer token 认证
-        # workspaceRoots: ['/workspace']   # cwd 白名单
+        # authToken: 'your-secret-token'   # Bearer token 认证(常数时间比较)
+        # workspaceRoots: ['/workspace']   # cwd 白名单(跨平台分隔符/大小写安全)
+        # allowedHosts: ['my-box.lan']     # Host 头白名单追加项(防 DNS rebinding)
         # preset: 'standard'               # 挂载的 agent preset
         # model: ''                        # 空 = 跟随 dsh 用户/默认设置
 ```
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `host` / `port` | `127.0.0.1` / `8090` | MCP server 监听地址 |
-| `authToken` | — | Bearer token；设置后所有请求强制校验 |
-| `workspaceRoots` | — | cwd 白名单；agent 只能在列出的目录下干活 |
+| `host` / `port` | `127.0.0.1` / `8090` | MCP server 监听地址；监听失败（如端口被占）会让插件启动显式失败 |
+| `authToken` | — | Bearer token；设置后所有请求强制校验（常数时间比较） |
+| `workspaceRoots` | — | cwd 白名单；agent 只能在列出的目录（含子目录）下干活 |
+| `allowedHosts` | — | Host 头白名单追加项；默认放行绑定地址与 loopback 别名，其余 403 |
 | `provider` / `model` / `preset` | `deepseek-official` / 跟随用户设置 / `standard` | 生成 agent 的配置 |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
+
+## 零宿主副本
+
+插件运行时对 `@deepseek-ai/*` **零依赖**：所有 dsh 能力都经注入的宿主服务
+（`ctx.agents` / `ctx.tools` / `ctx.agentPresets` …）访问；类型只在编译期做声明合并
+（`import type`，构建后擦除），`@deepseek-ai/*` 全部是 devDependencies。
+因此插件自带的新旧依赖副本永远不会与宿主进程内的私有 Symbol/类标识错位——
+上游 0.1.x 时代 `scopeOf` 副本不匹配导致 agent 静默失去全部工具的根因就此消除。
+事件读取走公开 API `session.snapshotEvents()`，消息构造用与宿主 `createUserMessage`
+逐字段一致的本地实现。
 
 ## 安全
 
 ⚠️ 这个插件暴露的是**本机执行能力**（等价于远程代码执行）。默认只监听 `127.0.0.1`。启用时务必：
 
-1. 配置 `authToken`——防本机其他进程与 DNS rebinding 攻击；
+1. 配置 `authToken`——防本机其他进程与 DNS rebinding 攻击（常数时间比较）；
 2. 配置 `workspaceRoots`——限定 agent 可操作的目录；
 3. 不要绑定 `0.0.0.0` 或暴露到局域网/公网，除非前面有反代 + TLS + 认证。
+
+内置防护：Host 头白名单（默认绑定地址 + loopback 别名，防 DNS rebinding，缺失 Host 400）；
+HTTP 入口只服务 `/mcp`，其余路径 404。
 
 ## 源码来源
 
@@ -120,23 +135,26 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 - **贴合当前版本 dsh**：见下方 Roadmap；
 - **独立命名与仓库**：`dsh-ops-mcp`。
 
-## Roadmap / 已知问题（对 dsh 0.1.5-rc.2）
+## Roadmap / 已知限制（对 dsh 0.1.5-rc.2）
 
-- [ ] `@deepseek-ai/dsh-*` 依赖仍钉在 0.1.0-rc.x 时代：与 0.1.5-rc.2 混装时，`scopeOf` 的模块私有 Symbol 不匹配会让 preset 挂载被跳过（agent 无工具）。需移除 scope 预检（让 `mount` 自行校验）或改用宿主侧判定。
-- [ ] `ctx.tools.keys()` 在 0.1.5 已不存在 → `dsh_list_tools` 返回空数组，改用 `ctx.tools.schemas()`。
-- [ ] `sessionPersistence.list()` 返回 `SessionPersistenceSnapshot[]`（header 在 `.header` 字段），按旧形状读取会失效。
-- [ ] `workspaceRegistry` 侧 `attachSession` 接口需重新核对。
-- [ ] Windows 下 `workspaceRoots` 子目录匹配因路径分隔符失效（`startsWith(root + '/')` 遇反斜杠路径）。
-- [ ] `apply()` 不等待 `listen`，端口被占用时静默失败。
+0.2.0 Roadmap 中的兼容性问题已全部在 **0.3.0** 处理完毕（见 [CHANGELOG](./CHANGELOG.md)）：scopeOf 预检移除、`dsh_list_tools` 改走 `schemas()`、持久化快照 `.header` 兼容、`workspaceRegistry.attachSession` 核对确认仍有效、Windows 白名单分隔符修复、`apply()` 等待 `listen`。
+
+仍然存在的限制：
+
+- [ ] 任务队列在进程内存中，进程重启丢失（后续可持久化）。
+- [ ] `agent_run` / `task_inbox` 无服务端超时与取消；调用方需自带 MCP 层超时。
+- [ ] spawn 出的会话里工具调用走宿主 approval 策略（ask 策略下会弹窗或 fail-closed）。
+- [ ] 尚未在真实 `dsh web --patch` 环境做端到端验证（当前以宿主接口核对 + 假 ctx 冒烟为准）。
+- [ ] dsh 未来版本升级时，devDeps 里的 `@deepseek-ai/*` 类型版本需同步（仅影响编译期，运行时零依赖不受影响）。
 
 ## 开发
 
 ```bash
 npm install
-npm run smoke    # 端口 8099 上的最小冒烟测试（假 ctx + 真实 MCP 协议往返）
+npm run build    # 独立构建(纯 tsc), 产出 lib/
+npm run smoke    # 端口 8099/8098 上的冒烟测试(假 ctx + 真实 MCP 协议往返, 24 项)
+                 # + 端口冲突专项(apply 必须显式失败)
 ```
-
-构建完整产物需要在 deepseek-harness 仓库树内执行（上游遗留的 `tsconfig.json` 相对引用），后续计划改为独立构建。
 
 ## License
 
