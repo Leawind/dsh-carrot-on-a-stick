@@ -26,6 +26,6 @@ jobs:
           node -e "const v=require('./package.json').version; const t=process.env.GITHUB_REF_NAME.slice(1); if(v!==t){console.error('tag v'+t+' != package.json '+v);process.exit(1)}; console.log('publishing', v)"
       - run: npm ci
       - run: npm test
-      - run: npm publish --provenance
+      - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
