@@ -28,12 +28,21 @@ dsh agent —— 完整工具集：bash、fs、todo、web…
 | 工具 | 用途 |
 |---|---|
 | `echo` | 验证 MCP 连通性 |
-| `dsh_list_tools` | 列出 dsh 当前注册的工具（name + description） |
-| `agent_run` | 同步执行任务，返回结构化结果；可传 `sessionId` 续接已有会话 |
+| `dsh_list_tools` | 列出 dsh 全局工具注册表（name + description；模型工具在 preset 作用域，通常为空） |
+| `agent_run` | 同步执行任务，返回结构化结果；`sessionId` 续接会话；`detail` 分级控制返回体积 |
 | `task_inbox` | 把结构化任务（任务+上下文+cwd）推入异步队列，返回 `taskId` |
-| `task_result` | 取回队列任务的结构化结果 |
+| `task_result` | 取回队列任务结果；`detail=status` 轻量轮询，不重复注入 payload |
 | `attach_session` | 把会话归组到其 cwd 对应的工作区 |
 | `rename_session` | 给已有会话改名 |
+
+**结果分级（token 预算）**——本插件的存在意义是省调用方（operator）的上下文：dsh 内部执行细节不进调用方上下文，读回按 `detail` 投影：
+
+- `summary`（默认，~数百 token）：`changes/verification/leftovers` 三行总结 + 回答尾部（总结 JSON 在末尾）+ 工具名列表 + `error`
+- `normal`（~2k token）：上述 + 截断的工具调用参数与结果
+- `full`（最坏数万 token，排查用）：完整原文
+- `task_result` 另有 `status` 档：轮询只返回 `{taskId, status, error?}`，完成后再取一次 summary——避免轮询把结果 payload 重复灌进上下文
+
+续接同一 `sessionId` 时，executor 已记得此前内容，`context` 建议**只发增量**。
 
 每个任务结果都是**结构化**的：`sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers`——调用方可以直接写回自己的记忆系统或工单。
 
@@ -111,10 +120,11 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 | `allowedHosts` | — | Host 头白名单追加项；默认放行绑定地址与 loopback 别名，其余 403 |
 | `provider` / `model` | 跟随宿主用户设置（`agentDefaultModel`） | 生成 agent 的模型选择；**需成对配置**，只配一边会用宿主默认补全另一边 |
 | `preset` | `standard` | 挂载的 agent preset |
+| `defaultDetail` | `summary` | `agent_run`/`task_result` 的默认详略级别（单次调用可用 `detail` 覆盖） |
 | `reattachOrphans` | `false` | 启动时把未分组会话补挂到工作区（批量写用户数据，默认关；`attach_session` 工具随时可用） |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
 
-每个任务结果都是**结构化**的：`sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers / error`——`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果。
+每个任务结果都是**结构化**的：`sessionId / changes / verification / leftovers / error / toolCallCount …`（按 detail 分级投影）；`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果。
 
 ## 零宿主副本
 

@@ -55,6 +55,8 @@ export interface Config {
     workspaceRoots?: string[];
     /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
     allowedHosts?: string[];
+    /** 结果默认详略级别(默认 summary; 单次调用可用 detail 参数覆盖) */
+    defaultDetail?: 'summary' | 'normal' | 'full';
     /**
      * 启动时存量捞回: 把现存未分组会话补挂到已注册工作区(默认 false)。
      * 0.1.5+ 的 workspaceRegistry 本身按 header.cwd 自动索引, 该操作只补充手动花名册——

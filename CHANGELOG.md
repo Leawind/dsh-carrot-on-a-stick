@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+**结果分级与 token 预算**——本插件的存在意义是省调用方上下文, 本次把"骨架对、默认浪费"的返回体积问题修掉:
+
+- `agent_run` / `task_result` 新增 `detail: summary | normal | full`(**默认 summary**):
+  - `summary`(~数百 token): 三行总结 + 回答尾部(总结 JSON 在末尾) + 工具名列表 + error;
+  - `normal`(~2k token): 加截断的工具调用参数与结果;
+  - `full`: 旧版全量行为(最坏数万 token, 排查用)。
+  旧版默认最坏可返回 ~15 万字符(toolCalls 50×2000 + toolResults 20×2000 + assistantText 8000)——一次调用就能把调用方上下文打穿, 比 computer use 读几张截图还贵。
+- `task_result` 新增 `detail: 'status'` 轻量轮询档: 只返回 `{taskId, status, error?}`, 完成后再取一次
+  summary——旧版每次轮询都返回完整结果 JSON, 轮询 5 次 = 5 份全量 payload 进上下文。
+- 内部 `TaskResult` 始终全量(队列与 sessionId 续接不丢信息), 投影只发生在返回前(`renderResult`, 各级
+  字段上限总和 ≤ 级别预算)。
+- 新配置 `defaultDetail`(默认 `summary`), 部署级默认、单次调用可覆盖。
+- `task_result` 返回从 `{taskId, status, result: {...}}` 改为**扁平**载荷(少一层嵌套, 少几十字节)。
+- 使用建议(已写入 README): 续接同一 `sessionId` 时 `context` 只发增量。
+- 冒烟测试扩到 31 项(summary 形状不泄漏原文、full 档保留原文、status 轮询不注入 payload、
+  队列默认 summary 投影)。
+
 ## 0.3.1
 
 真机 E2E 验证（dsh 0.1.5-rc.2 独立 profile + 真实 agent 任务，全绿）驱动的修复，
