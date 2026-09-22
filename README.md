@@ -41,13 +41,19 @@ Sessions are reused per cwd (LRU, default 8) to avoid reloading project context 
 
 ## Install & run
 
+The plugin must be installed into a dsh **profile directory** (the loader resolves plugin names from there; `--patch` alone from a repo checkout will not find the local package — see finding 1 in the [E2E report](./docs/e2e-0.1.5-rc.2.zh.md)):
+
 ```bash
 git clone https://github.com/Leawind/dsh-ops-mcp.git
 cd dsh-ops-mcp
-npm install
+npm install && npm run build
+npm pack                                        # produces dsh-ops-mcp-<ver>.tgz
 
-export DEEPSEEK_API_KEY=...
-dsh web --patch ./cordis.yml
+# install into the profile (Windows note: use the tarball; pnpm mangles file:D:/... specifiers)
+pnpm -C ~/.dsh/profiles/<profile> add -w <path-to-tarball>
+
+export DEEPSEEK_API_KEY=...                     # model credentials (or use what ~/.dsh already stores)
+dsh --profile <profile> --patch ./cordis.yml --no-open --port 3081
 ```
 
 The MCP server listens on `127.0.0.1:8090` (StreamableHTTP). Point any MCP client at `http://127.0.0.1:8090/mcp`.
@@ -103,8 +109,12 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `authToken` | — | Bearer token; enforced on every request when set (constant-time compare) |
 | `workspaceRoots` | — | cwd whitelist; agents may only work inside the listed directories (subdirs included) |
 | `allowedHosts` | — | extra allowed Host-header values; the bind host and loopback aliases are always allowed, everything else gets 403 |
-| `provider` / `model` / `preset` | `deepseek-official` / follow user settings / `standard` | spawned-agent configuration |
+| `provider` / `model` | follow host user settings (`agentDefaultModel`) | spawned-agent model selection; **configure as a pair** — a partial setting is completed from the host default |
+| `preset` | `standard` | agent preset to mount |
+| `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
+
+Every result is structured: `sessionId / assistantText / toolCalls / toolResults / changes / verification / leftovers / error` — `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
 
 ## Zero host copies
 
@@ -137,18 +147,14 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 ## Roadmap / known limitations (against dsh 0.1.5-rc.2)
 
-The compatibility issues listed in the 0.2.0 roadmap were all fixed in **0.3.0** (see
-[CHANGELOG](./CHANGELOG.md)): the `scopeOf` pre-check removal, `dsh_list_tools` switching to
-`schemas()`, the persistence-snapshot `.header` compat, `workspaceRegistry.attachSession`
-re-verification (still the official pattern), the Windows whitelist separator fix, and `apply()`
-awaiting `listen`.
+The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 
 What remains:
 
 - [ ] The task queue lives in process memory; a restart loses it (persistence is future work).
-- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox`; callers should bring their own MCP-level timeout.
-- [ ] Tool calls inside spawned sessions go through the host approval policy (with `ask` they pop a dialog or fail closed).
-- [ ] No end-to-end verification against a live `dsh web --patch` yet (current verification = host-interface audit + fake-ctx smoke).
+- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it; callers should bring their own MCP-level timeout.
+- [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
+- [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
 - [ ] When dsh releases new versions, the `@deepseek-ai/*` devDependencies need syncing (compile-time only; the zero-runtime-dependency design is unaffected).
 
 ## Development
@@ -156,9 +162,13 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # smoke tests on ports 8099/8098 (fake ctx + real MCP protocol round-trips, 24 checks)
+npm run smoke    # fake-ctx smoke on ports 8099/8098 (27 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
+
+Live-host E2E (needs a local dsh with model credentials; costs a few tokens): boot a dedicated
+profile as described in [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md), then run
+`E2E_WITH_AGENT=1 node e2e.mjs`.
 
 ## License
 

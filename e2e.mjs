@@ -1,0 +1,121 @@
+// E2E verification against a REAL dsh host (not shipped; dev-only).
+// Zero-token phase: initialize / tools/list / echo / dsh_list_tools.
+// Agent phase (E2E_WITH_AGENT=1): one minimal tool-using agent_run — verifies preset
+// mounting (toolCalls non-empty), local userMessage() acceptance, snapshotEvents
+// extraction, and the summary contract on a live agent-loop.
+//
+// Usage: E2E_MCP_URL=http://127.0.0.1:8090/mcp [E2E_WITH_AGENT=1] node e2e.mjs
+const BASE = process.env.E2E_MCP_URL ?? 'http://127.0.0.1:8090/mcp'
+const WITH_AGENT = process.env.E2E_WITH_AGENT === '1'
+const CWD = process.env.E2E_CWD ?? process.cwd()
+const AGENT_TIMEOUT_MS = Number(process.env.E2E_AGENT_TIMEOUT_MS ?? 180_000)
+
+async function rpc(sessionId, body) {
+  const res = await fetch(BASE, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  const sid = res.headers.get('mcp-session-id') ?? sessionId
+  const text = await res.text()
+  return { sid, status: res.status, text }
+}
+
+function parsePayload(text) {
+  for (const line of text.split('\n')) {
+    const t = line.trim()
+    if (t.startsWith('data: ')) return JSON.parse(t.slice(6))
+  }
+  return JSON.parse(text)
+}
+
+function innerOf(resp) {
+  const payload = parsePayload(resp.text)
+  if (payload.error) return { error: payload.error.message, raw: payload }
+  const r = payload.result
+  if (r.isError) return { error: r.content?.[0]?.text ?? 'isError', raw: payload }
+  const text = r.content?.[0]?.text
+  try { return JSON.parse(text) } catch { return { error: `non-JSON result: ${String(text).slice(0, 200)}`, raw: payload } }
+}
+
+const findings = []
+function report(name, ok, detail = '') {
+  findings.push({ name, ok, detail })
+  console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`)
+}
+function finish() {
+  const failed = findings.filter((f) => !f.ok)
+  console.log(failed.length === 0 ? (WITH_AGENT ? '\nE2E PASS' : '\nE2E PASS (zero-token phase)') : `\nE2E FAIL (${failed.length} 项)`)
+  process.exitCode = failed.length === 0 ? 0 : 1
+}
+
+try {
+  const init = await rpc(undefined, {
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'e2e', version: '1.0' } },
+  })
+  report('initialize(MCP 握手)', init.status === 200 && Boolean(init.sid), `server=${parsePayload(init.text).result?.serverInfo?.name ?? '?'}`)
+  const sid = init.sid
+  await rpc(sid, { jsonrpc: '2.0', method: 'notifications/initialized' })
+
+  const toolsList = await rpc(sid, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
+  const names = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
+  const expected = ['echo', 'dsh_list_tools', 'agent_run', 'task_inbox', 'task_result', 'attach_session', 'rename_session']
+  report('tools/list 七工具齐', expected.every((n) => names.includes(n)), names.join(','))
+
+  const echo = await rpc(sid, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'e2e-ping' } } })
+  report('echo 往返', echo.status === 200 && echo.text.includes('e2e-ping'))
+
+  const listTools = await rpc(sid, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'dsh_list_tools', arguments: {} } })
+  const lt = innerOf(listTools)
+  report('dsh_list_tools 返回数组', Array.isArray(lt), Array.isArray(lt) ? `${lt.length} 个全局工具: ${lt.slice(0, 8).map((t) => t.name).join(',')}${lt.length > 8 ? '…' : ''}` : String(lt.error).slice(0, 120))
+
+  if (!WITH_AGENT) {
+    console.log('\n(zero-token phase done; set E2E_WITH_AGENT=1 for the live agent_run leg)')
+    finish()
+  } else {
+
+  // ── agent 阶段: 一次最小的真实任务(一条列目录命令 + 行内 JSON 总结) ──
+  console.log(`\nagent_run: cwd=${CWD} (timeout ${AGENT_TIMEOUT_MS}ms)`)
+  const t0 = Date.now()
+  const runPromise = rpc(sid, {
+    jsonrpc: '2.0', id: 5, method: 'tools/call',
+    params: {
+      name: 'agent_run',
+      arguments: {
+        task: '用一条命令列出当前目录下的文件名(只要文件名, 不要内容), 然后输出总结。',
+        cwd: CWD,
+        title: 'dsh-ops-mcp e2e',
+      },
+    },
+  })
+  const timer = new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), AGENT_TIMEOUT_MS))
+  const run = await Promise.race([runPromise, timer])
+  if (run.timeout) {
+    report('agent_run 在限时内返回', false, `TIMEOUT after ${AGENT_TIMEOUT_MS}ms(可能卡在审批或模型路由)`)
+    finish()
+  } else {
+  const inner = run.status === 200 ? innerOf(run) : { error: `HTTP ${run.status}` }
+  const secs = ((Date.now() - t0) / 1000).toFixed(1)
+  report('agent_run 返回无错误', !inner.error, inner.error ? String(inner.error).slice(0, 200) : `${secs}s`)
+  if (!inner.error) {
+    report('sessionId 存在', typeof inner.sessionId === 'string' && inner.sessionId.length > 0, String(inner.sessionId).slice(0, 40))
+    report('toolCalls 非空(preset 挂载成功)', Array.isArray(inner.toolCalls) && inner.toolCalls.length > 0,
+      `calls=${inner.toolCalls?.map((c) => c.name).join(',')}`)
+    report('toolResults 非空(事件提取成功)', Array.isArray(inner.toolResults) && inner.toolResults.length > 0)
+    report('assistantText 非空', typeof inner.assistantText === 'string' && inner.assistantText.trim().length > 0,
+      String(inner.assistantText).slice(0, 100).replace(/\n/g, ' '))
+    report('summary 解析(changes/verification)', Boolean(inner.changes || inner.verification),
+      `changes="${String(inner.changes).slice(0, 80)}"`)
+  }
+  finish()
+  }
+  }
+} catch (e) {
+  console.error('E2E ERROR:', e)
+  process.exitCode = 1
+}

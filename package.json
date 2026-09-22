@@ -1,6 +1,6 @@
 {
   "name": "dsh-ops-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Operate DeepSeek Harness (dsh) over MCP: expose dsh sessions, task execution, and workspace management as an MCP server for any MCP client.",
   "type": "module",
   "main": "lib/index.js",

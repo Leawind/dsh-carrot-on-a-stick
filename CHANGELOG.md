@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.1
+
+真机 E2E 验证（dsh 0.1.5-rc.2 独立 profile + 真实 agent 任务，全绿）驱动的修复，
+详见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)。
+
+- **`{{model}}` 提示词变量修复（核心）**：agent-loop 把 `{{model}}` 直接读 `agent.options.model`，
+  不做默认解析（默认模型解析在 Web 应用层）。v0.3.0 的默认 `provider: 'deepseek-official'` 无
+  `model` 让每个 turn 在 persona 组装期失败。现在 `resolveAgentOptions()`：provider+model 成对
+  显式配置直接用，部分配置经 `ctx.agentDefaultModel.currentSelection()` 补全，仍不完整则明确
+  报错；默认 provider 撤空（跟随宿主用户设置）。
+- **turn 失败透出**：`TaskResult.error` 承接 `turn/end` 的非 completed 收场
+  （LlmError/取消/blocked/max-tokens），另加"完全无产出"兜底——不再返回"成功"的空结果。
+- **池会话 flush**：任务后统一 best-effort flush（官方语义：消费者自读存储需自行 flush），
+  否则 durable log 只有 header，重启续接丢历史。
+- **存量捞回默认关闭**（`reattachOrphans: true` 显式开启）：真机一次补挂 156 个历史会话
+  （批量写用户数据）；0.1.5 的 workspaceRegistry 已按 header.cwd 自动索引，该 rc.6 时代的
+  workaround 属过度行为。`attach_session` 工具保留随时手动归组。
+- **`dsh_list_tools` 语义澄清**：0.1.5+ 模型工具挂在 preset/agent 作用域，全局注册表通常为空；
+  工具描述已说明以 `agent_run` 的 toolCalls 为准。
+- **安装文档修正**：loader 从 profile 目录解析插件名——仓库根 `dsh web --patch ./cordis.yml`
+  找不到本地包；改为 tarball 装进 profile 再 `--patch`（Windows 下 pnpm 对 `file:D:/...` 会拼坏
+  路径，用 tarball）。
+- 冒烟测试扩到 27 项（错误透出路径、模型选择补全断言）；新增 `e2e.mjs`（真机 E2E 客户端，
+  零 token 阶段 + 环境变量门控的 agent 阶段）。
+
 ## 0.3.0
 
 对齐 dsh 0.1.5-rc.2 的兼容性修复 + 安全加固 + 独立构建。详见 [docs/compat-review-upstream-0.1.10.zh.md](./docs/compat-review-upstream-0.1.10.zh.md)（修复依据）。
