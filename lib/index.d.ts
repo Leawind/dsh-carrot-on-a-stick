@@ -81,6 +81,12 @@ export interface Config {
     authToken?: string;
     /** cwd 白名单(设置后 agent 只能在列出的目录下干活; 跨平台分隔符/大小写安全) */
     workspaceRoots?: string[];
+    /**
+     * 任务队列持久化文件(默认空 = 不持久化, 重启丢队列)。设置后每次队列变化即串行落盘,
+     * apply 时恢复: done/error/cancelled 连结果一起回来, queued 重新执行, running 如实标记
+     * 为 "interrupted by restart"(无法安全续跑半个 turn)。
+     */
+    queuePersistPath?: string;
     /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
     allowedHosts?: string[];
     /** 结果默认详略级别(默认 summary; 单次调用可用 detail 参数覆盖) */

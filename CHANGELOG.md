@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.0
+
+**任务队列持久化（可选）**——Roadmap 上最后一项收尾：
+
+- **新配置 `queuePersistPath`**（默认空 = 不持久化，行为与旧版完全一致）：设置文件路径后，
+  每次队列变化即**串行落盘**（最后写入胜出），`apply` 时恢复快照——
+  - `done` / `error` / `cancelled` 连结果一起回来，调用方重启后仍可 `task_result` 取回；
+  - `queued`（含锁内等待）重新入队自动执行；
+  - `running` 无法安全续跑半个 turn，如实标记为 `interrupted by restart`。
+- **`running` 语义修正**：原来提交即标记 running（cwd 锁内等待也算"执行中"），现在只有
+  真正拿到锁开始执行才翻转（`executeTask` 新增 `onStart` 锁内回调）——`task_list` 的
+  排队/执行中从此名副其实，持久化快照也因此不失真。
+- GUI 面板状态摘要显示队列是否持久化。
+- 冒烟测试 84 → 88 项：真实"卸载→重启"流程验证 done 结果取回 / running 标记 interrupted /
+  queued 重新执行并取消。
+
 ## 0.8.0
 
 **自动超时 + 细节打磨**——0.7.0 取消面之上的收尾（Roadmap"无服务端自动超时"就此关闭）：
