@@ -116,8 +116,12 @@ const errAgent = (() => {
   }
 })()
 
+/** 池新建会话的注册表(模拟真实宿主: create 的会话即进入 sessions 服务) */
+const liveCreatedSessions = new Map()
+
 const fakeSessions = {
-  get: (id) => (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : id === 'sess-err' ? errAgent.session : undefined),
+  get: (id) => liveCreatedSessions.get(id)
+    ?? (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : id === 'sess-err' ? errAgent.session : undefined),
   list: () => [liveSession2, liveAgent.session],
   flush: async (session) => { flushed.push(session.id); return true },
 }
@@ -204,6 +208,7 @@ function makeCtx({ sessionController, llm = {}, sessionTitle, tools = fakeTools 
         const agent = String(meta?.cwd ?? '').includes('slow-cwd')
           ? makeSlowAgent(id, meta?.cwd, agentOptions)
           : makeAgent(id, meta?.cwd, agentOptions)
+        liveCreatedSessions.set(id, agent.session)
         if (setup) await setup({}, agent)
         return { agent, dispose: async () => { disposed.push(id) } }
       },
@@ -562,6 +567,12 @@ try {
   const histPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 74, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-persisted' } } })
   checks['session_history: 持久化-only 会话明确报不可读'] = parsePayload(histPersisted.text).result?.isError === true
     && String(innerOf(histPersisted).error ?? '').includes('not live')
+
+  // 池新建会话(runNew 的 sessionId)也在 sessions 服务里 → 纪要可读
+  const histNew = await rpc(init.sid, { jsonrpc: '2.0', id: 88, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: created[0].id, limit: 5 } } })
+  const hNew = histNew.status === 200 ? innerOf(histNew) : { turns: [] }
+  checks['session_history: 池新建会话纪要(user+assistant)'] = Array.isArray(hNew.turns) && hNew.turns.length >= 2
+    && hNew.turns.some((t) => t.role === 'user') && hNew.turns.some((t) => t.role === 'assistant')
 
   // ── rename_session: 成功(走 sessionTitle 服务)与未知会话 ──
   const renameOk = await rpc(init.sid, { jsonrpc: '2.0', id: 75, method: 'tools/call', params: { name: 'rename_session', arguments: { sessionId: 'sess-live', title: 'renamed-live' } } })
