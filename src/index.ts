@@ -48,7 +48,7 @@ import { z } from 'zod'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { readFile, realpath, writeFile } from 'node:fs/promises'
+import { readFile, realpath, rename, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import { resolve, sep } from 'node:path'
 
@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.6'
+const PLUGIN_VERSION = '0.11.7'
 
 /**
  * 声明依赖的核心服务。
@@ -1721,7 +1721,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const persistQueue = () => {
     if (!persistPath) return
     persistChain = persistChain
-      .then(() => writeFile(persistPath, JSON.stringify([...taskQueue.values()])))
+      .then(async () => {
+        // 原子写: 先落 .tmp 再 rename, persistPath 上的文件永远是完整 JSON(崩溃不留半截)
+        const tmp = `${persistPath}.tmp`
+        await writeFile(tmp, JSON.stringify([...taskQueue.values()]))
+        await rename(tmp, persistPath)
+      })
       .catch((e) => console.warn('[dsh-ops-mcp] queue persist failed:', (e as Error)?.message ?? e))
   }
   persistQueueHook = persistQueue

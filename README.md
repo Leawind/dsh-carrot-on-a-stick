@@ -23,6 +23,25 @@ dsh-ops-mcp (MCP server, 127.0.0.1:8090)
 dsh agent — full toolset: bash, fs, todo, web…
 ```
 
+`agent_run` lifecycle (progress + cancellation are spec-native):
+
+```mermaid
+sequenceDiagram
+    participant C as MCP Client
+    participant S as dsh-ops-mcp
+    participant A as dsh Agent
+    C->>S: tools/call agent_run (task, cwd, _meta.progressToken)
+    S->>S: lock (cwd/session) → pool hit or create
+    S->>A: followup(userMessage)
+    S-->>C: notifications/progress (started, events=0)
+    loop every progressIntervalMs
+        S-->>C: notifications/progress (events N)
+    end
+    Note over C,A: cancel (notifications/cancelled) → official agent.cancel({kind:user})
+    A-->>S: turn/end (completed | error | cancelled)
+    S-->>C: CallToolResult (isError?, sessionId, changes/verification/leftovers…)
+```
+
 ## Tools
 
 | Tool | Purpose |
