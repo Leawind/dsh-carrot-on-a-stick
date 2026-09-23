@@ -1012,6 +1012,14 @@ try {
     checks['GUI 路由: 同源 start 重新监听'] = startOk.status === 200 && JSON.parse(startOk.body).started === true
     const st3 = await callGui('status')
     checks['GUI 路由: start 后 listening=true'] = JSON.parse(st3.body).listening === true
+    // 闭环: 重启后的服务必须能真实完成一次 MCP 握手(而不只是标志位翻真)
+    const afterStart = await fetch('http://127.0.0.1:8088/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-restart', version: '1.0' } } }),
+    })
+    checks['GUI start 后真实 HTTP 握手可达'] = afterStart.status === 200 && Boolean(afterStart.headers.get('mcp-session-id'))
+    await afterStart.text()
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
   }
