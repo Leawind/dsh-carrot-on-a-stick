@@ -217,6 +217,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 - [ ] spawn 出的会话里工具调用走宿主 approval 策略（`ask` 下敏感操作可能弹窗或 fail-closed；本次 E2E 的只读操作未受影响）。
 - [ ] `dsh_list_tools` 只列宿主全局注册表；按 agent 作用域列出实际可用工具需要宿主侧 API（ScopeKey 私有符号，零副本原则下拿不到）。
 - [ ] `select_model` 依赖 web profile 的 `sessionController`；该服务缺席时（如 headless）只有目录回退与按调用覆盖可用，工具会明确报不可用。
+- [ ] 协议原生 task augmentation（2025-11-25 草案，SDK 接口标注 experimental）：把 `agent_run` 暴露为规范原生任务，走 `tasks/get` / `tasks/result` 轮询。有意缓做——`task_inbox` / `task_result` / `task_cancel` 已对所有客户端覆盖同一工作流，等规范离开草案再评估。
 - [ ] dsh 未来版本升级时，devDeps 里的 `@deepseek-ai/*` 类型版本需同步（仅影响编译期，运行时零依赖不受影响）。
 
 ## 开发

@@ -58,13 +58,15 @@ JSON-RPC 2.0（RFC 无版本规范本体）。
 
 ## 验证
 
-- 冒烟测试 57 → 93 项（真实 HTTP + 官方 SDK 传输层往返）：生命周期/会话/取消/超时/持久化/
-  进度心跳/错误语义/安全门禁全覆盖；
-- 真机 E2E（`e2e.mjs`）：零 token 相 13 工具接线探针 + agent 相全链路。
+- 冒烟测试 57 → 98 项（真实 HTTP + 官方 SDK 传输层往返）：生命周期/会话/取消/超时/持久化/
+  进度心跳/错误语义/安全门禁/并发与锁清理全覆盖；
+- 真机 E2E（`e2e.mjs`）：零 token 相 13 工具接线探针 + agent 相全链路（含真机 progress 心跳）。
 
 ## 已知剩余限制
 
 - 仅持久化的会话无法读取完整历史（宿主未暴露整日志加载 API，`session_history` 只覆盖 live）；
 - 持久化为单文件 JSON，适合单机部署，无并发多写者保护；
 - `notifications/progress` 在 `_enableJsonResponse` 模式（非 SSE 响应）下不可用——本插件
-  默认 SSE 模式，不受影响。
+  默认 SSE 模式，不受影响；
+- 协议原生 task augmentation（2025-11-25 草案，SDK 接口标注 experimental）有意缓做：
+  自定义 `task_inbox` / `task_result` / `task_cancel` 已覆盖同一工作流，等规范稳定再评估。

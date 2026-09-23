@@ -218,6 +218,7 @@ What remains:
 - [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
 - [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
 - [ ] `select_model` requires the web profile's `sessionController`; where that service is absent (e.g. headless) only the catalog fallback and per-call overrides work, and the tool says so explicitly.
+- [ ] Protocol-native task augmentation (2025-11-25 draft, SDK marks the interfaces experimental): `agent_run` as a spec-native task with `tasks/get` / `tasks/result` polling. Deliberately deferred — our `task_inbox` / `task_result` / `task_cancel` already cover the workflow for all clients; revisit when the spec leaves draft.
 - [ ] When dsh releases new versions, the `@deepseek-ai/*` devDependencies need syncing (compile-time only; the zero-runtime-dependency design is unaffected).
 
 ## Development
