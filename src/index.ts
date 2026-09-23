@@ -6,12 +6,14 @@
  *   - dsh_list_tools   : 列出 dsh 工具注册表(name + description)
  *   - model_list       : 列出当前可路由的 provider/模型/推理档(选模型前先查这里)
  *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果;
- *                        客户端 notifications/cancelled 取消 → 官方 agent.cancel({kind:'user'})
+ *                        客户端 notifications/cancelled 取消 → 官方 agent.cancel({kind:'user'});
+ *                        调用方 _meta.progressToken → notifications/progress 心跳(新增会话事件数)
  *   - task_inbox       : 调用方 push 结构化任务(任务+上下文)到 dsh 队列, 异步执行, 返回 taskId
  *   - task_result      : 取回任务的结构化结果(changes/verification/leftovers)
  *   - task_list        : 列出队列中的任务(taskId/状态/cwd; 队列可观测)
  *   - task_cancel      : 取消排队/执行中的任务(执行中走官方 agent.cancel)
  *   - session_list     : 列出已知会话元数据(live+持久化合并, 只读)
+ *   - session_history  : 读 live 会话的对话纪要(从最新往回取, 文本截断, 只读)
  *   - select_model     : 切换已存在会话使用的模型(官方 selectModel 路径)
  *   - attach_session   : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session   : 给已有会话改名
@@ -54,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.9.0'
+const PLUGIN_VERSION = '0.10.0'
 
 /**
  * 声明依赖的核心服务。
@@ -90,6 +92,11 @@ export interface Config {
    * 长任务(大改动/长分析)部署请按需调大或保持关闭。
    */
   taskTimeoutMs?: number
+  /**
+   * 进度心跳间隔毫秒数(默认 5000, 最小 250)。仅在调用方于 _meta.progressToken 里请求进度时
+   * 生效: agent turn 期间按该间隔发 notifications/progress(内容为新增会话事件数)。
+   */
+  progressIntervalMs?: number
   /** 已完成任务保留毫秒数(默认 10 分钟) */
   taskTtlMs?: number
   /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
@@ -132,6 +139,7 @@ const DEFAULTS = {
   preset: 'standard',
   maxQueue: 100,
   taskTimeoutMs: 0,
+  progressIntervalMs: 5000,
   taskTtlMs: 10 * 60 * 1000,
   maxAgents: 8,
   sessionTtlMs: 24 * 60 * 60 * 1000,
@@ -685,9 +693,67 @@ function renderResult(result: TaskResult, detail: DetailLevel): Record<string, u
   }
 }
 
-/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果; signal 中止时走官方 cancel;
- *  onStart 在拿到 cwd/session 锁、真正开始执行时回调(队列据此区分"排队"与"执行中") */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string, override?: ModelSelectionOverride, signal?: AbortSignal, onStart?: () => void): Promise<TaskResult> {
+/** 递归收集事件数据里的文本(text/content 字段; 数组与嵌套对象都走) */
+function extractTexts(value: unknown, out: string[] = []): string[] {
+  if (Array.isArray(value)) { value.forEach((x) => extractTexts(x, out)); return out }
+  if (value && typeof value === 'object') {
+    const rec = value as Record<string, unknown>
+    if (typeof rec.text === 'string' && rec.text.trim()) out.push(rec.text)
+    if (typeof rec.content === 'string' && rec.content.trim()) out.push(rec.content)
+    for (const v of Object.values(rec)) extractTexts(v, out)
+  }
+  return out
+}
+
+/**
+ * 会话事件 → 轮次纪要(从最新往回取 limit 条, 返回时按时间正序排列)。
+ * 事件形状与 executeTask 的解析一致: assistant/message, user/message, tool/call, tool/result, turn/end。
+ * 长文本按角色截断, 防止整段历史灌穿调用方上下文。
+ */
+function historyTurnsOf(events: readonly unknown[], limit: number): Record<string, unknown>[] {
+  const turns: Record<string, unknown>[] = []
+  for (let i = events.length - 1; i >= 0 && turns.length < limit; i--) {
+    const ev = events[i] as { type?: string; data?: unknown } | undefined
+    if (ev?.type === 'assistant/message') {
+      const d = ev.data as { message?: { content?: { type?: string; text?: string }[] } } | undefined
+      const text = (d?.message?.content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join('\n')
+      if (text.trim()) turns.unshift({ index: i, role: 'assistant', text: clip(text, 600) })
+    } else if (ev?.type === 'user/message') {
+      turns.unshift({ index: i, role: 'user', text: clip(extractTexts(ev.data).join('\n'), 200) })
+    } else if (ev?.type === 'tool/call') {
+      const d = ev.data as { name?: string; arguments?: string; input?: unknown } | undefined
+      turns.unshift({ index: i, role: 'tool_call', name: d?.name ?? '?', args: clip(String(d?.arguments ?? JSON.stringify(d?.input ?? null) ?? ''), 200) })
+    } else if (ev?.type === 'tool/result') {
+      const texts = extractTexts(ev.data ?? ev).join('\n')
+      if (texts.trim()) turns.unshift({ index: i, role: 'tool_result', text: clip(texts, 300) })
+    } else if (ev?.type === 'turn/end') {
+      const d = ev.data as { turn?: number; reason?: { kind?: string } } | undefined
+      turns.unshift({ index: i, role: 'turn_end', kind: d?.reason?.kind ?? '?' })
+    }
+  }
+  return turns
+}
+
+/** executeTask 的参数包(位置参数超过 8 个, 收拢成对象) */
+interface ExecuteTaskOptions {
+  ctx: Context
+  task: string
+  context: string
+  cwd: string
+  resumeSessionId?: string
+  title?: string
+  override?: ModelSelectionOverride
+  /** 外部取消信号(MCP notifications/cancelled / 队列 task_cancel) */
+  signal?: AbortSignal
+  /** 拿到 cwd/session 锁、真正开始执行时回调(队列据此区分"排队"与"执行中") */
+  onStart?: () => void
+  /** 进度心跳(可选): agent turn 期间定期回调, 参数为本次新增的会话事件数 */
+  reportProgress?: (events: number) => void
+}
+
+/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果; signal 中止时走官方 cancel */
+async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult> {
+  const { ctx, task, context, cwd, resumeSessionId, title, override, signal, onStart, reportProgress } = opts
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
@@ -733,10 +799,21 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
         timeoutAbort.abort()
       }, taskTimeoutMs)
       : undefined
+    // 进度心跳(可选, 调用方在 _meta.progressToken 请求时才激活): 定期回报新增会话事件数
+    let progressTimer: ReturnType<typeof setInterval> | undefined
+    if (reportProgress) {
+      progressTimer = setInterval(() => {
+        try {
+          const events = Math.max(0, eventsOf(handle.agent.session).length - baseline)
+          void Promise.resolve(reportProgress(events)).catch(() => { /* 单次心跳失败不影响任务 */ })
+        } catch { /* 忽略单次心跳失败 */ }
+      }, runtimeConfig.progressIntervalMs)
+    }
     try {
       await awaitIdleCancellable(handle.agent, handle.agent.whenIdle(), timeoutAbort.signal, () => cancelCause)
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer)
+      if (progressTimer) clearInterval(progressTimer)
       signal?.removeEventListener('abort', onOuterAbort)
     }
 
@@ -749,15 +826,6 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     try {
       const events = eventsOf(handle.agent.session).slice(baseline)
       observedEvents = events.length
-      const extractText = (obj: unknown, outTexts: string[]): void => {
-        if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, outTexts)); return }
-        if (obj && typeof obj === 'object') {
-          const rec = obj as Record<string, unknown>
-          if (typeof rec.text === 'string' && rec.text.trim()) outTexts.push(rec.text)
-          if (typeof rec.content === 'string' && rec.content.trim()) outTexts.push(rec.content)
-          for (const v of Object.values(rec)) extractText(v, outTexts)
-        }
-      }
       for (const e of events) {
         const ev = e as {
           type?: string
@@ -777,8 +845,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
             args: (d?.arguments ?? JSON.stringify(d?.input ?? null) ?? '').slice(0, 2000),
           })
         } else if (ev.type === 'tool/result') {
-          const texts: string[] = []
-          extractText(ev.data ?? ev, texts)
+          const texts = extractTexts(ev.data ?? ev)
           if (texts.length) result.toolResults.push(texts.join('\n').slice(0, 3000))
         } else if (ev.type === 'turn/end') {
           // 失败透出: turn 的非 completed 收场(LlmError/取消/blocked/max-tokens)进 error 字段。
@@ -1160,7 +1227,27 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ task, context, cwd, sessionId, title, detail, provider, model, reasoningEffort }, extra) => {
       // extra.signal: 客户端发 notifications/cancelled(MCP 规范的请求取消)时中止 → 官方 agent.cancel
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, selectionOverrideOf({ provider, model, reasoningEffort }), extra?.signal)
+      // extra._meta.progressToken: 调用方请求进度(MCP notifications/progress) → agent turn 期间定期回报
+      const progressToken = extra?._meta?.progressToken
+      const send = extra?.sendNotification
+      let progressTick = 0
+      const reportProgress = progressToken !== undefined && typeof send === 'function'
+        ? (events: number) => send({
+          method: 'notifications/progress',
+          params: { progressToken, progress: ++progressTick, message: `agent running: ${events} new session events` },
+        })
+        : undefined
+      const result = await executeTask({
+        ctx,
+        task,
+        context: context ?? '',
+        cwd: cwd ?? process.cwd(),
+        resumeSessionId: sessionId,
+        title,
+        override: selectionOverrideOf({ provider, model, reasoningEffort }),
+        signal: extra?.signal,
+        reportProgress,
+      })
       const rendered = JSON.stringify(renderResult(result, detail ?? runtimeConfig.defaultDetail), null, 2)
       // turn 失败透出: 带错误的执行结果按 MCP 规范标 isError, 严格客户端/模型可直接识别为失败
       return result.error ? outError(rendered) : out(rendered)
@@ -1331,6 +1418,29 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           ...(h.agentPreset ? { agentPreset: h.agentPreset } : {}),
         }))
       return out(JSON.stringify({ total: headers.size, sessions: items }))
+    },
+  )
+
+  // 会话纪要(只读): 读 live 会话的事件快照, 从最新往回取; 长文本按角色截断省上下文
+  mcp.registerTool(
+    'session_history',
+    {
+      title: 'Session history',
+      description: '读取一个 live 会话的对话纪要(user/assistant/tool_call/tool_result/turn_end 轮次, 从最新往回取, 文本截断)。只支持内存中的 live 会话; 已持久化但不在内存的会话, 宿主未暴露整日志加载 API, 无法读取。',
+      inputSchema: {
+        sessionId: z.string().describe('会话 id(live; 来自 agent_run 结果或 session_list)'),
+        limit: z.number().int().min(1).max(50).optional().describe('最多返回轮数(默认 10)'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ sessionId, limit }) => {
+      const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
+      const session = sessions?.get?.(sessionId)
+      if (!session) {
+        return outError(JSON.stringify({ error: `session not live: ${sessionId} (persisted-only sessions cannot be read back; host does not expose a full-log load API)` }))
+      }
+      const events = eventsOf(session)
+      return out(JSON.stringify({ sessionId, totalEvents: events.length, turns: historyTurnsOf(events, limit ?? 10) }))
     },
   )
 
@@ -1546,6 +1656,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     preset: config.preset ?? DEFAULTS.preset,
     maxQueue: config.maxQueue ?? DEFAULTS.maxQueue,
     taskTimeoutMs: config.taskTimeoutMs ?? DEFAULTS.taskTimeoutMs,
+    progressIntervalMs: Math.max(250, config.progressIntervalMs ?? DEFAULTS.progressIntervalMs),
     taskTtlMs: config.taskTtlMs ?? DEFAULTS.taskTtlMs,
     maxAgents: config.maxAgents ?? DEFAULTS.maxAgents,
     sessionTtlMs: config.sessionTtlMs ?? DEFAULTS.sessionTtlMs,
@@ -1570,11 +1681,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       try {
         // 排队期间已被取消: 不再投递给 agent, 直接收敛(cancel 已由 task_cancel 完成)
         if (item.controller?.signal.aborted) return
-        item.result = await executeTask(
-          ctx, item.task, item.context, item.cwd, item.sessionId, item.title, selectionOverrideOf(item), item.controller?.signal,
+        item.result = await executeTask({
+          ctx,
+          task: item.task,
+          context: item.context,
+          cwd: item.cwd,
+          resumeSessionId: item.sessionId,
+          title: item.title,
+          override: selectionOverrideOf(item),
+          signal: item.controller?.signal,
           // running 只在真正拿到 cwd/session 锁开始执行时才标记(排队含锁内等待, 持久化快照才不失真)
-          () => { item.status = 'running'; persistQueue() },
-        )
+          onStart: () => { item.status = 'running'; persistQueue() },
+        })
         item.result.taskId = item.id
         item.status = item.controller?.signal.aborted ? 'cancelled' : 'done'
       } catch (e) {

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.0
+
+**进度心跳与会话纪要**——补齐 MCP 交互面最后两块：
+
+- **`agent_run` 支持 `notifications/progress` 心跳**（MCP 规范的进度机制）：调用方在请求
+  `_meta.progressToken` 里带上令牌，agent turn 执行期间按 `progressIntervalMs`（新配置，
+  默认 5 秒，最小 250）在响应 SSE 流上收到进度通知——`progress` 单调递增，`message` 带
+  本次新增的会话事件数。不传令牌的调用方完全不受影响。与取消/超时共用一条 abort 路径，
+  心跳定时器在 turn 收敛时清除。
+- **新工具 `session_history`**（只读）：读 live 会话的对话纪要——user/assistant/tool_call/
+  tool_result/turn_end 轮次，从最新往回取（`limit` 默认 10），文本按角色截断省上下文。
+  已持久化但不在内存的会话明确报不可读（宿主未暴露整日志加载 API），不再假装能查。
+- **重构**：`executeTask` 的 9 个位置参数收拢为 `ExecuteTaskOptions` 对象；事件文本提取
+  提升为模块级 `extractTexts`（与 `session_history` 共用）。
+- E2E：工具清单断言更新到 13 个；新增 `session_history` 两条真机探针（不存在会话 isError
+  拒绝 / agent 相读刚执行会话的轮次）。
+- 冒烟测试 88 → 93 项：SSE 流上实时收到 progress 心跳 / progress 单调递增且带 message /
+  history 纪要解析与 limit / 持久化-only 会话不可读。
+
 ## 0.9.0
 
 **任务队列持久化（可选）**——Roadmap 上最后一项收尾：

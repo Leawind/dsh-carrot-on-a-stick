@@ -30,12 +30,13 @@ dsh agent — full toolset: bash, fs, todo, web…
 | `echo` | connectivity check |
 | `dsh_list_tools` | list the host-global tool registry (name + description; model tools are preset-scoped, usually empty) |
 | `model_list` | list currently routable providers, model ids, reasoning efforts, and the default selection (look here before picking a model) |
-| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size; cancellable via the MCP `notifications/cancelled` (the host agent's official `cancel` is invoked) |
+| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size; cancellable via the MCP `notifications/cancelled` (the host agent's official `cancel` is invoked); reports `notifications/progress` heartbeats when the caller passes `_meta.progressToken` |
 | `task_inbox` | push a structured task (task + context + cwd + model) into the async queue, returns `taskId` |
 | `task_result` | fetch a queued task's result; `detail=status` is a lightweight poll that never re-injects the payload |
 | `task_list` | list queued/running/finished tasks (queue observability) |
 | `task_cancel` | cancel a queued or running task (a running one is cancelled through the host's official `agent.cancel`) |
 | `session_list` | list known sessions (live + persisted, newest first) to pick `sessionId`s for continuation |
+| `session_history` | read a live session's transcript summary (user/assistant/tool turns, newest first, truncated) |
 | `select_model` | switch the model of an **existing session** (official `sessionController.selectModel` path) |
 | `attach_session` | attach a session to the workspace of its cwd |
 | `rename_session` | rename an existing session |
@@ -156,6 +157,7 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
 | `taskTimeoutMs` | `0` (off) | auto-timeout per agent turn; on expiry the host's official `agent.cancel({kind:'hook'})` fires and the result's `error` notes the timeout. Raise it for long-task deployments |
+| `progressIntervalMs` | `5000` (min 250) | heartbeat interval for `notifications/progress` on `agent_run` — only active when the caller passes `_meta.progressToken` |
 | `queuePersistPath` | — (off) | persist the task queue to this file: every change is written, and on startup `done`/`error`/`cancelled` tasks come back with their results, `queued` tasks re-execute, and `running` tasks are honestly marked `interrupted by restart` |
 | `sessionTtlMs` | `86400000` (24 h) | reap idle MCP transport sessions after this long; clients get 404 on the stale session id and re-initialize per the spec (`0` = never reap) |
 
@@ -204,13 +206,14 @@ The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host 
 **0.7.0 completed the cancellation & observability surface**: `agent_run` honours the MCP `notifications/cancelled` (wired to the host's official `agent.cancel({kind:'user'})`), and new `task_cancel` / `task_list` / `session_list` tools make the queue listable+cancellable and sessions discoverable — both previously open roadmap items.
 **0.8.0 closed the last roadmap gap in this area**: optional `taskTimeoutMs` auto-timeout (official hook-cause cancel + `error` annotation), `session_list` surfaces live session titles, GUI queue stats split failed/cancelled.
 **0.9.0 added opt-in queue persistence** (`queuePersistPath`): task state survives restarts — finished results stay fetchable, queued tasks re-execute, interrupted running tasks are reported honestly. `running` status is now only set when a task actually starts executing (lock acquired), so `task_list` distinguishes queued from running precisely.
+**0.10.0 completed the interactive surface**: `notifications/progress` heartbeats for `agent_run` (spec `_meta.progressToken`), and a read-only `session_history` tool for live-session transcripts. A full protocol audit is documented in [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md).
 
 What remains:
 
 - [x] ~~The task queue lives in process memory; a restart loses it~~ — 0.9.0 added opt-in persistence (`queuePersistPath`); without it, the queue is still memory-only.
 - [x] ~~No server-side timeout for `agent_run` / `task_inbox`~~ — 0.8.0 added the opt-in `taskTimeoutMs` (off by default); callers can also cancel actively (`notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks).
 - [x] ~~The queue cannot be listed or cancelled either~~ — done in 0.7.0 (`task_list` / `task_cancel`).
-- [x] ~~Read-only query surface is still incomplete~~ — `session_list` (0.7.0) joins `attach_session` / `rename_session` / `select_model`; reading a session's full history is still future work.
+- [x] ~~Read-only query surface is still incomplete~~ — `session_list` (0.7.0) + `session_history` (0.10.0, live sessions) join `attach_session` / `rename_session` / `select_model`; reading the full log of persisted-only sessions needs a host-side load API.
 - [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
 - [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
 - [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
@@ -222,7 +225,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092 (88 checks, real MCP protocol round-trips)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092/8091 (93 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
 

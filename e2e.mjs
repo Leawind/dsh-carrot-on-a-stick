@@ -67,8 +67,8 @@ try {
 
   const toolsList = await rpc(sid, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
   const names = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
-  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'task_list', 'task_cancel', 'session_list', 'select_model', 'attach_session', 'rename_session']
-  report('tools/list 十二工具齐(含 model_list/select_model/task_*/session_list)', expected.every((n) => names.includes(n)), names.join(','))
+  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'task_list', 'task_cancel', 'session_list', 'session_history', 'select_model', 'attach_session', 'rename_session']
+  report('tools/list 十三工具齐(含 model_list/select_model/task_*/session_*)', expected.every((n) => names.includes(n)), names.join(','))
 
   const echo = await rpc(sid, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'e2e-ping' } } })
   report('echo 往返', echo.status === 200 && echo.text.includes('e2e-ping'))
@@ -122,6 +122,11 @@ try {
   report('session_list 返回清单', !sl.error && Number.isInteger(sl.total) && Array.isArray(sl.sessions),
     sl.error ? String(sl.error).slice(0, 120) : `total=${sl.total} 最新: ${sl.sessions.slice(0, 3).map((s) => String(s.sessionId).slice(0, 8)).join(',')}`)
 
+  const histProbe = await rpc(sid, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'e2e-nonexistent-session' } } })
+  const histPayload = parsePayload(histProbe.text).result
+  report('session_history 不存在会话以 isError 拒绝', histPayload?.isError === true,
+    String(innerOf(histProbe).error ?? '').slice(0, 120))
+
   if (!WITH_AGENT) {
     console.log('\n(zero-token phase done; set E2E_WITH_AGENT=1 for the live agent_run leg)')
     finish()
@@ -163,6 +168,11 @@ try {
     report('session_list 包含刚执行的会话(live 归并)', !slAfter.error
       && slAfter.sessions?.some((s) => s.sessionId === inner.sessionId),
       slAfter.error ? String(slAfter.error).slice(0, 120) : `total=${slAfter.total}`)
+    const histAfter = innerOf(await rpc(sid, { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: inner.sessionId, limit: 6 } } }))
+    report('session_history 读到刚执行的轮次', !histAfter.error
+      && Array.isArray(histAfter.turns) && histAfter.turns.length > 0,
+      histAfter.error ? String(histAfter.error).slice(0, 120)
+        : `turns=${histAfter.turns.length} roles=${histAfter.turns.map((t) => t.role).join(',')}`)
   }
   finish()
   }
