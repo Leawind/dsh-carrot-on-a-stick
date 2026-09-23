@@ -23,6 +23,25 @@ dsh-ops-mcp（MCP server, 127.0.0.1:8090）
 dsh agent —— 完整工具集：bash、fs、todo、web…
 ```
 
+`agent_run` 生命周期（进度与取消均为规范原生机制）：
+
+```mermaid
+sequenceDiagram
+    participant C as MCP 客户端
+    participant S as dsh-ops-mcp
+    participant A as dsh Agent
+    C->>S: tools/call agent_run (task, cwd, _meta.progressToken)
+    S->>S: 锁(cwd/session) → 池命中或新建
+    S->>A: followup(userMessage)
+    S-->>C: notifications/progress (已启动, events=0)
+    loop 每 progressIntervalMs
+        S-->>C: notifications/progress (events N)
+    end
+    Note over C,A: 取消(notifications/cancelled) → 官方 agent.cancel({kind:user})
+    A-->>S: turn/end (completed | error | cancelled)
+    S-->>C: CallToolResult (isError?, sessionId, changes/verification/leftovers…)
+```
+
 ## 工具
 
 | 工具 | 用途 |

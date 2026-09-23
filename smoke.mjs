@@ -17,7 +17,7 @@
 //  10. 取消与可观测: agent_run 经 notifications/cancelled 取消(官方 agent.cancel)、
 //      task_cancel/task_list 队列观测、session_list/session_history 查询面
 //  11. LRU 淘汰跳过活跃会话、并发压力、GUI 控制面路由(status/stop/start 同源门禁)
-import { realpathSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
 
@@ -824,7 +824,8 @@ try {
     checks['队列持久化: queued 重启后重新执行'] = gBItem?.status === 'running'
     const gCancel = innerOf(await phaseG2.call('task_cancel', { taskId: gB.taskId }))
     checks['队列持久化: 重启后的任务可取消'] = gCancel.cancelled === true
-    await new Promise((r) => setTimeout(r, 200))
+    await new Promise((r) => setTimeout(r, 300)) // 等写入链静默
+    checks['队列持久化: 无 .tmp 残留(原子写)'] = !existsSync(`${persistPath}.tmp`)
     try { unlinkSync(persistPath) } catch { /* 已清理 */ }
   }
 

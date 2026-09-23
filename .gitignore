@@ -4,3 +4,4 @@ node_modules/
 commit-msg.txt
 *.tgz
 smoke-run.log
+.smoke-queue*.json
