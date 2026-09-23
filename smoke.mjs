@@ -790,6 +790,23 @@ try {
     await new Promise((r) => setTimeout(r, 150))
   }
 
+  // ── Phase I: 并发压力 —— 不同 cwd 并行执行 / 同 cwd 串行复用同一会话 ──
+  {
+    const ctxI = makeCtx({ llm: fakeLlm })
+    const phaseI = await startPhase(8089, ctxI, {})
+    const concCwds = [1, 2, 3, 4, 5, 6].map((n) => resolve(FAKE_CWD, `conc-${n}`))
+    const concRuns = await Promise.all(concCwds.map((c, i) => phaseI.call('agent_run', { task: `t${i}`, cwd: c })))
+    checks['并发: 6 个不同 cwd 的任务全部成功'] = concRuns.every((r) => Boolean(innerOf(r).sessionId))
+    const sameCwd = resolve(FAKE_CWD, 'conc-same')
+    const sameRuns = await Promise.all([1, 2, 3].map((i) => phaseI.call('agent_run', { task: `s${i}`, cwd: sameCwd })))
+    const sameIds = new Set(sameRuns.map((r) => innerOf(r).sessionId))
+    checks['并发: 同 cwd 三任务串行复用同一会话'] = sameIds.size === 1 && Boolean([...sameIds][0])
+    const listDuring = await phaseI.call('task_list', {})
+    checks['并发: 混合查询不受影响'] = listDuring.status === 200
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [checkName, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${checkName}`)
   console.log('attach_session 路径记录:', JSON.stringify(attachedIds))
