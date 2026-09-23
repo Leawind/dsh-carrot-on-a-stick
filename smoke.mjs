@@ -14,7 +14,7 @@
 //   9. 协议严格性: 工具错误结果带 isError(MCP 规范 SHOULD)、成功结果省略空 error/taskId、
 //      工具带 title+annotations(2025-06-18 字段)、401 带 WWW-Authenticate、
 //      Origin 白名单(跨域/null 拒, 同源放行)、404 体不再挪用 -32601、会话空闲 TTL GC
-import { realpathSync } from 'node:fs'
+import { realpathSync, unlinkSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
 
@@ -688,6 +688,34 @@ try {
   // 不带超时的正常 agent_run 不受影响(phaseF 默认任务走快 agent)
   const normalRun = innerOf(await phaseF.call('agent_run', { task: 'quick job' }))
   checks['taskTimeoutMs: 不影响正常完成的任务'] = Boolean(normalRun.sessionId) && !normalRun.error
+
+  // ── Phase G: 队列持久化(queuePersistPath) —— 重启后 done 结果仍可取回 / running 标记被打断 / queued 重新执行 ──
+  {
+    const persistPath = resolve(FAKE_CWD, '.smoke-queue.json')
+    try { unlinkSync(persistPath) } catch { /* 首次不存在 */ }
+    const ctxG = makeCtx({ llm: fakeLlm })
+    const phaseG = await startPhase(8092, ctxG, { queuePersistPath: persistPath })
+    const gA = innerOf(await phaseG.call('task_inbox', { task: 'slow A', cwd: slowCwd }))
+    const gB = innerOf(await phaseG.call('task_inbox', { task: 'slow B', cwd: slowCwd }))
+    const gC = innerOf(await phaseG.call('task_inbox', { task: 'quick', cwd: FAKE_CWD }))
+    await new Promise((r) => setTimeout(r, 400)) // A running(慢), B queued(锁内), C done → 全部落盘
+    // 重启: 卸载(关 server + 清内存队列) → 同配置重新 apply(恢复快照)
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 300))
+    const phaseG2 = await startPhase(8092, ctxG, { queuePersistPath: persistPath })
+    const resC = innerOf(await phaseG2.call('task_result', { taskId: gC.taskId }))
+    checks['队列持久化: done 结果重启后仍可取回'] = resC.taskId === gC.taskId && resC.changes === 'c1'
+    const resA = innerOf(await phaseG2.call('task_result', { taskId: gA.taskId }))
+    checks['队列持久化: running 重启后如实标记 interrupted'] = String(resA.error ?? '').includes('"status":"error"')
+      && String(resA.error ?? '').includes('interrupted')
+    const gList = innerOf(await phaseG2.call('task_list', { status: 'running' }))
+    const gBItem = Array.isArray(gList) ? gList.find((t) => t.taskId === gB.taskId) : undefined
+    checks['队列持久化: queued 重启后重新执行'] = gBItem?.status === 'running'
+    const gCancel = innerOf(await phaseG2.call('task_cancel', { taskId: gB.taskId }))
+    checks['队列持久化: 重启后的任务可取消'] = gCancel.cancelled === true
+    await new Promise((r) => setTimeout(r, 200))
+    try { unlinkSync(persistPath) } catch { /* 已清理 */ }
+  }
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [checkName, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${checkName}`)

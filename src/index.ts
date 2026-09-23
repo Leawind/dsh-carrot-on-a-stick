@@ -46,7 +46,7 @@ import { z } from 'zod'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { realpath } from 'node:fs/promises'
+import { readFile, realpath, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import { resolve, sep } from 'node:path'
 
@@ -54,7 +54,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.8.0'
+const PLUGIN_VERSION = '0.9.0'
 
 /**
  * 声明依赖的核心服务。
@@ -103,6 +103,12 @@ export interface Config {
   authToken?: string
   /** cwd 白名单(设置后 agent 只能在列出的目录下干活; 跨平台分隔符/大小写安全) */
   workspaceRoots?: string[]
+  /**
+   * 任务队列持久化文件(默认空 = 不持久化, 重启丢队列)。设置后每次队列变化即串行落盘,
+   * apply 时恢复: done/error/cancelled 连结果一起回来, queued 重新执行, running 如实标记
+   * 为 "interrupted by restart"(无法安全续跑半个 turn)。
+   */
+  queuePersistPath?: string
   /** Host 头白名单(除绑定地址与 loopback 别名外额外放行的主机名; 对外暴露时按需配置) */
   allowedHosts?: string[]
   /** 结果默认详略级别(默认 summary; 单次调用可用 detail 参数覆盖) */
@@ -131,6 +137,7 @@ const DEFAULTS = {
   sessionTtlMs: 24 * 60 * 60 * 1000,
   authToken: '',
   workspaceRoots: [] as string[],
+  queuePersistPath: '',
   defaultDetail: 'summary' as 'summary' | 'normal' | 'full',
 }
 
@@ -678,8 +685,9 @@ function renderResult(result: TaskResult, detail: DetailLevel): Record<string, u
   }
 }
 
-/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果; signal 中止时走官方 cancel */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string, override?: ModelSelectionOverride, signal?: AbortSignal): Promise<TaskResult> {
+/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果; signal 中止时走官方 cancel;
+ *  onStart 在拿到 cwd/session 锁、真正开始执行时回调(队列据此区分"排队"与"执行中") */
+async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string, override?: ModelSelectionOverride, signal?: AbortSignal, onStart?: () => void): Promise<TaskResult> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
@@ -697,6 +705,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     if (signal?.aborted) {
       return { taskId: '', sessionId: '', model: { provider: '', model: '' }, assistantText: '', toolCalls: [], toolResults: [], changes: '', verification: '', leftovers: '', error: 'cancelled before start' }
     }
+    onStart?.()
     const { sessionId, handle, disposeAfter, selection } = await getAgent(ctx, workdir, resumeSessionId, title, override)
     // 事件基线: 只读本轮新增事件(公开 API snapshotEvents; 旧宿主回退 log 字段)
     const baseline = eventsOf(handle.agent.session).length
@@ -850,6 +859,13 @@ interface TaskItem {
   finishedAt?: number
 }
 const taskQueue = new Map<string, TaskItem>()
+
+/**
+ * 当前 apply 的任务执行器与持久化钩子。taskQueue 是模块级共享, 每次 apply 重新绑定;
+ * registerTools 里的 task_inbox/task_cancel/task_list 经这两个钩子操作, 不直接依赖 apply 作用域。
+ */
+let runTaskItem: (item: TaskItem) => void = () => { throw new Error('dsh-ops-mcp not applied') }
+let persistQueueHook: () => void = () => {}
 
 /** TTL 清理: 删除已完成/失败/已取消且超时的任务(task_inbox/task_list 入口顺带调用) */
 function sweepExpiredTasks(): void {
@@ -1171,6 +1187,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ task, context, cwd, sessionId, title, provider, model, reasoningEffort }) => {
       sweepExpiredTasks()
+      persistQueueHook()
       // 队列容量上限: 活动任务(排队+执行中)超过上限则拒绝
       let active = 0
       for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
@@ -1189,21 +1206,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞调用方); task_cancel 经 controller.abort() → executeTask 走官方 agent.cancel
-      void (async () => {
-        item.status = 'running'
-        try {
-          // 排队期间已被取消: 不再投递给 agent, 直接收敛(cancel 已由 task_cancel 完成)
-          if (item.controller?.signal.aborted) return
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, selectionOverrideOf(item), item.controller?.signal)
-          item.result.taskId = id
-          item.status = item.controller?.signal.aborted ? 'cancelled' : 'done'
-        } catch (e) {
-          item.error = String(e)
-          item.status = item.controller?.signal.aborted ? 'cancelled' : 'error'
-        } finally {
-          item.finishedAt = Date.now()
-        }
-      })()
+      runTaskItem(item)
+      persistQueueHook()
       return out(JSON.stringify({ taskId: id, status: 'queued' }))
     },
   )
@@ -1257,6 +1261,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       item.controller?.abort()
       item.status = 'cancelled'
+      persistQueueHook()
       return out(JSON.stringify({ taskId, status: item.status, cancelled: true }))
     },
   )
@@ -1274,6 +1279,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ status }) => {
       sweepExpiredTasks() // 顺带清一次过期项, 防列表被撑大
+      persistQueueHook()
       const items = [...taskQueue.values()]
         .filter((t) => !status || t.status === status)
         .map((t) => ({
@@ -1545,7 +1551,70 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     sessionTtlMs: config.sessionTtlMs ?? DEFAULTS.sessionTtlMs,
     authToken: config.authToken ?? DEFAULTS.authToken,
     workspaceRoots: (config.workspaceRoots ?? []).map((r) => resolve(r)),
+    queuePersistPath: config.queuePersistPath ?? DEFAULTS.queuePersistPath,
     defaultDetail: config.defaultDetail ?? DEFAULTS.defaultDetail,
+  }
+
+  // ── 任务队列持久化(可选): 队列变化串行落盘(最后写入胜出), apply 时恢复 ──
+  const persistPath = runtimeConfig.queuePersistPath
+  let persistChain: Promise<unknown> = Promise.resolve()
+  const persistQueue = () => {
+    if (!persistPath) return
+    persistChain = persistChain
+      .then(() => writeFile(persistPath, JSON.stringify([...taskQueue.values()])))
+      .catch((e) => console.warn('[dsh-ops-mcp] queue persist failed:', (e as Error)?.message ?? e))
+  }
+  persistQueueHook = persistQueue
+  runTaskItem = (item: TaskItem) => {
+    void (async () => {
+      try {
+        // 排队期间已被取消: 不再投递给 agent, 直接收敛(cancel 已由 task_cancel 完成)
+        if (item.controller?.signal.aborted) return
+        item.result = await executeTask(
+          ctx, item.task, item.context, item.cwd, item.sessionId, item.title, selectionOverrideOf(item), item.controller?.signal,
+          // running 只在真正拿到 cwd/session 锁开始执行时才标记(排队含锁内等待, 持久化快照才不失真)
+          () => { item.status = 'running'; persistQueue() },
+        )
+        item.result.taskId = item.id
+        item.status = item.controller?.signal.aborted ? 'cancelled' : 'done'
+      } catch (e) {
+        item.error = String(e)
+        item.status = item.controller?.signal.aborted ? 'cancelled' : 'error'
+      } finally {
+        item.finishedAt = Date.now()
+        persistQueue()
+      }
+    })()
+  }
+
+  // 恢复上次进程的队列快照: done/error/cancelled 连结果一起回来, queued 重新执行,
+  // running 无法安全续跑半个 turn——如实标记为 interrupted by restart。
+  if (persistPath) {
+    try {
+      const raw = await readFile(persistPath, 'utf8')
+      const items = JSON.parse(raw) as TaskItem[]
+      let restored = 0
+      for (const item of items) {
+        if (taskQueue.has(item.id)) continue
+        if (item.status === 'running') {
+          item.status = 'error'
+          item.error = 'interrupted by restart (turn state is not resumable; re-submit if needed)'
+          item.finishedAt = item.finishedAt ?? Date.now()
+        } else if (item.status === 'queued') {
+          item.controller = new AbortController()
+        }
+        taskQueue.set(item.id, item)
+        restored++
+      }
+      for (const item of [...taskQueue.values()]) {
+        if (item.status === 'queued') runTaskItem(item)
+      }
+      if (restored > 0) console.log(`[dsh-ops-mcp] queue restored from ${persistPath}: ${restored} items`)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.warn('[dsh-ops-mcp] queue restore failed:', (e as Error)?.message ?? e)
+      }
+    }
   }
 
   const port = config.port ?? 8090
@@ -1676,6 +1745,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         maxQueue: runtimeConfig.maxQueue,
         taskTimeoutMs: runtimeConfig.taskTimeoutMs,
         sessionTtlMs: runtimeConfig.sessionTtlMs,
+        queuePersist: persistPath !== '',
         authEnabled: runtimeConfig.authToken !== '',
         workspaceRoots: runtimeConfig.workspaceRoots,
       },
