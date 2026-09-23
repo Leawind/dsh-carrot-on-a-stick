@@ -168,9 +168,17 @@ const fakeLlm = {
 /**
  * 最小假 ctx: services 里没有的走 undefined。
  * sessionController 只作为同名属性提供(证明 serviceOf 的属性回退可用, 也方便造"没有它"的部署)。
+ * 提供假 webServer: 捕获 GUI 控制面注册的 handler, 供 Phase J 直接调用路由(同源校验/启停)。
  */
 function makeCtx({ sessionController, llm = {} } = {}) {
-  return {
+  const webHandlers = new Map()
+  const fakeWebServer = {
+    register: ({ path, handler }) => {
+      webHandlers.set('gui', handler)
+      return () => webHandlers.delete('gui')
+    },
+  }
+  const ctx = {
     tools: fakeTools,
     llm,
     sessionController,
@@ -200,8 +208,13 @@ function makeCtx({ sessionController, llm = {} } = {}) {
     sessionPersistence: fakePersistence,
     workspaceRegistry: wsRegistry,
     effect: (fn) => { const d = fn(); disposers.push(d); return d },
-    // 依赖注入桩: 假 ctx 不是真 cordis, webServer 这类可选依赖在 headless 相位不应出现 → 不调用回调
-    inject: () => undefined,
+    inject: (deps, fn) => {
+      if (deps.includes('webServer')) {
+        // 注入的子 ctx 同样要带 effect(GUI 路由的卸载清理经它登记)
+        fn({ webServer: fakeWebServer, effect: (fn2) => { const d = fn2(); disposers.push(d); return d } })
+      }
+    },
+    __webHandlers: webHandlers,
     get: (name) => (name === 'workspaceRegistry' ? wsRegistry
       : name === 'sessions' ? fakeSessions
         : name === 'sessionPersistence' ? fakePersistence
@@ -209,6 +222,7 @@ function makeCtx({ sessionController, llm = {} } = {}) {
             : name === 'agentDefaultModel' ? fakeAgentDefaultModel
               : undefined),
   }
+  return ctx
 }
 
 const ctx = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm })
@@ -803,6 +817,44 @@ try {
     checks['并发: 同 cwd 三任务串行复用同一会话'] = sameIds.size === 1 && Boolean([...sameIds][0])
     const listDuring = await phaseI.call('task_list', {})
     checks['并发: 混合查询不受影响'] = listDuring.status === 200
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
+  // ── Phase J: GUI 控制面路由 —— status 快照 / stop-start 同源门禁 / 软停启循环 ──
+  {
+    const { EventEmitter } = await import('node:events')
+    const ctxJ = makeCtx({ llm: fakeLlm })
+    const gui = ctxJ.__webHandlers
+    await apply(ctxJ, { port: 8088, host: '127.0.0.1' })
+    const handler = gui.get('gui')
+    const callGui = (route, { httpMethod = 'GET', headers = {} } = {}) => {
+      const req = new EventEmitter()
+      Object.assign(req, { method: httpMethod, url: `/_dsh/dsh-ops-mcp/${route}`, headers })
+      const res = {
+        status: 0, headers: {}, body: '',
+        writeHead(code, h) { this.status = code; Object.assign(this.headers, h || {}) },
+        end(b) { this.body = String(b ?? '') },
+      }
+      const done = handler(req, res)
+      setImmediate(() => req.emit('end')) // 消费 POST body 流(GET 无监听者, no-op)
+      return done.then(() => res)
+    }
+    const st = await callGui('status')
+    const stBody = st.status === 200 ? JSON.parse(st.body) : {}
+    checks['GUI 路由: status 快照(版本/监听/配置)'] = st.status === 200 && typeof stBody.version === 'string'
+      && typeof stBody.listening === 'boolean' && typeof stBody.config?.sessionTtlMs === 'number'
+      && stBody.stats?.connections === 0 && Array.isArray(stBody.connections)
+    const stopCross = await callGui('stop', { httpMethod: 'POST' })
+    checks['GUI 路由: 无同源标识的 stop 被 403(CSRF 门禁)'] = stopCross.status === 403
+    const stopOk = await callGui('stop', { httpMethod: 'POST', headers: { 'sec-fetch-site': 'same-origin' } })
+    checks['GUI 路由: 同源 stop 成功'] = stopOk.status === 200 && JSON.parse(stopOk.body).stopped === true
+    const st2 = await callGui('status')
+    checks['GUI 路由: stop 后 listening=false'] = JSON.parse(st2.body).listening === false
+    const startOk = await callGui('start', { httpMethod: 'POST', headers: { 'sec-fetch-site': 'same-origin' } })
+    checks['GUI 路由: 同源 start 重新监听'] = startOk.status === 200 && JSON.parse(startOk.body).started === true
+    const st3 = await callGui('status')
+    checks['GUI 路由: start 后 listening=true'] = JSON.parse(st3.body).listening === true
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
   }
