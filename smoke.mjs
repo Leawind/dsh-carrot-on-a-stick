@@ -67,7 +67,7 @@ function makeAgent(id, cwd, options) {
 }
 
 const liveAgent = makeAgent('sess-live', FAKE_CWD, { provider: 'live-p', model: 'live-m' })
-const liveSession2 = { id: 'sess-live2', header: { version: 0, id: 'sess-live2', createdAt: 1, cwd: FAKE_CWD } }
+const liveSession2 = { id: 'sess-live2', title: 'Live Two', header: { version: 0, id: 'sess-live2', createdAt: 1, cwd: FAKE_CWD } }
 
 // 慢 agent: whenIdle 挂起直到 cancel(模拟宿主 cancel 中止 turn 后收敛), 验证取消链路
 const slowCancelCalls = []
@@ -498,6 +498,7 @@ try {
     && sl.sessions.some((s) => s.sessionId === 'sess-live2')
     && sl.sessions.some((s) => s.sessionId === 'sess-persisted')
     && sl.sessions.some((s) => s.sessionId === 'sess-legacy')
+    && sl.sessions.find((s) => s.sessionId === 'sess-live2')?.title === 'Live Two'
   const sessListLim = await rpc(init.sid, { jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'session_list', arguments: { limit: 2 } } })
   const slLim = sessListLim.status === 200 ? innerOf(sessListLim) : { total: 0, sessions: [] }
   checks['session_list: limit 截断且 total 不变'] = slLim.sessions.length === 2 && slLim.total === sl.total
@@ -677,6 +678,16 @@ try {
   })
   checks['TTL: 客户端可重新 initialize 建新会话'] = reInit.status === 200 && Boolean(reInit.headers.get('mcp-session-id'))
   await reInit.text()
+
+  // ── Phase F: taskTimeoutMs 自动超时 —— turn 超时以 hook 原因走官方 cancel, error 注明 timed out ──
+  const phaseF = await startPhase(8093, makeCtx({ llm: fakeLlm }), { taskTimeoutMs: 300 })
+  const timeoutRun = innerOf(await phaseF.call('agent_run', { task: 'long job', sessionId: 'sess-slow' }))
+  checks['taskTimeoutMs: 超时结果 error 注明 timed out'] = String(timeoutRun.error ?? '').includes('timed out after 300ms')
+  checks['taskTimeoutMs: 以 hook 原因触发官方 agent.cancel'] = slowLiveAgent.cancelCalls.at(-1)?.kind === 'hook'
+    && String(slowLiveAgent.cancelCalls.at(-1)?.reason ?? '').includes('task timeout')
+  // 不带超时的正常 agent_run 不受影响(phaseF 默认任务走快 agent)
+  const normalRun = innerOf(await phaseF.call('agent_run', { task: 'quick job' }))
+  checks['taskTimeoutMs: 不影响正常完成的任务'] = Boolean(normalRun.sessionId) && !normalRun.error
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [checkName, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${checkName}`)

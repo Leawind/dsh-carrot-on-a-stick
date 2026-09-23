@@ -54,7 +54,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.7.0'
+const PLUGIN_VERSION = '0.8.0'
 
 /**
  * 声明依赖的核心服务。
@@ -84,6 +84,12 @@ export interface Config {
   preset?: string
   /** 任务队列容量上限(默认 100) */
   maxQueue?: number
+  /**
+   * 任务自动超时毫秒数(默认 0 = 不启用)。agent turn 执行超过该时长即走官方
+   * agent.cancel({kind:'hook', reason:'task timeout'}), 结果 error 会注明超时。
+   * 长任务(大改动/长分析)部署请按需调大或保持关闭。
+   */
+  taskTimeoutMs?: number
   /** 已完成任务保留毫秒数(默认 10 分钟) */
   taskTtlMs?: number
   /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
@@ -119,6 +125,7 @@ const DEFAULTS = {
   allowModelOverride: true,
   preset: 'standard',
   maxQueue: 100,
+  taskTimeoutMs: 0,
   taskTtlMs: 10 * 60 * 1000,
   maxAgents: 8,
   sessionTtlMs: 24 * 60 * 60 * 1000,
@@ -512,13 +519,14 @@ async function withLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * 等待 agent 收敛到 idle; abort 信号触发时走官方 `agent.cancel({kind:'user'})`
- * (中止当前 turn 并清掉未开工的排队输入), 再等 whenIdle 收敛——withLock 的锁持有到
- * 收敛为止, 取消不会与后续 followup 并发。宿主缺 cancel(旧版本)时退化为不可取消:
- * 忽略信号继续等原 promise。取消的收场经 turn/end 事件进 result.error。
+ * 等待 agent 收敛到 idle; abort 信号触发时走官方 `agent.cancel(...)`(中止当前 turn 并清掉
+ * 未开工的排队输入), 再等 whenIdle 收敛——withLock 的锁持有到收敛为止, 取消不会与后续
+ * followup 并发。取消原因由 getCause 现取(外部取消 = user, 超时 = hook+reason)。
+ * 宿主缺 cancel(旧版本)时退化为不可取消: 忽略信号继续等原 promise。
+ * 取消的收场经 turn/end 事件进 result.error。
  */
-async function awaitIdleCancellable(agent: AgentHandle['agent'], pending: Promise<void>, signal?: AbortSignal): Promise<void> {
-  const cancel = () => (agent as { cancel?: (cause: unknown, options?: unknown) => void }).cancel?.({ kind: 'user' })
+async function awaitIdleCancellable(agent: AgentHandle['agent'], pending: Promise<void>, signal?: AbortSignal, getCause: () => unknown = () => ({ kind: 'user' })): Promise<void> {
+  const cancel = () => (agent as { cancel?: (cause: unknown, options?: unknown) => void }).cancel?.(getCause())
   if (!signal) return pending
   if (signal.aborted) {
     cancel()
@@ -702,7 +710,26 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     ].filter(Boolean).join('\n')
 
     handle.agent.followup(userMessage(fullTask))
-    await awaitIdleCancellable(handle.agent, handle.agent.whenIdle(), signal)
+    // 超时门禁(taskTimeoutMs=0 关闭): 到点以 hook 原因走官方 cancel, 与外部取消信号合流到同一 abort
+    const taskTimeoutMs = runtimeConfig.taskTimeoutMs
+    let timedOut = false
+    let cancelCause: unknown = { kind: 'user' }
+    const timeoutAbort = new AbortController()
+    const onOuterAbort = () => timeoutAbort.abort()
+    signal?.addEventListener('abort', onOuterAbort, { once: true })
+    const timeoutTimer = taskTimeoutMs > 0
+      ? setTimeout(() => {
+        timedOut = true
+        cancelCause = { kind: 'hook', reason: `dsh-ops-mcp: task timeout after ${taskTimeoutMs}ms` }
+        timeoutAbort.abort()
+      }, taskTimeoutMs)
+      : undefined
+    try {
+      await awaitIdleCancellable(handle.agent, handle.agent.whenIdle(), timeoutAbort.signal, () => cancelCause)
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer)
+      signal?.removeEventListener('abort', onOuterAbort)
+    }
 
     // 结构化读输出
     const result: TaskResult = {
@@ -762,6 +789,10 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
       }
     } catch (e) {
       result.assistantText = `[读输出异常] ${String(e)}`
+    }
+    // 超时透出: turn/end 事件里只有 canceled 收场, 这里补上"谁砍的、砍的时候多久"
+    if (timedOut) {
+      result.error = (result.error ? `${result.error} | ` : '') + `task timed out after ${taskTimeoutMs}ms (official agent.cancel fired)`
     }
     // 完全无产出且无错误事件时给出可诊断的兜底(而不是一份"成功"的空结果)
     if (!result.assistantText && !result.error) {
@@ -1271,8 +1302,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     async ({ limit }) => {
       // 与 reattachOrphanSessions 同款合并: live 优先, 持久化侧兼容快照/裸 header 两种形状
       const headers = new Map<string, SessionHeader>()
-      const sessions = ctx.get('sessions') as { list?: () => { header: SessionHeader }[] } | undefined
-      for (const session of sessions?.list?.() ?? []) headers.set(session.header.id, session.header)
+      const liveTitles = new Map<string, string>()
+      const sessions = ctx.get('sessions') as { list?: () => { header: SessionHeader; title?: unknown }[] } | undefined
+      for (const session of sessions?.list?.() ?? []) {
+        headers.set(session.header.id, session.header)
+        // live 会话对象可能带 title(sessionTitle 服务维护); 机会式读取, 没有就省略字段
+        if (typeof session.title === 'string' && session.title) liveTitles.set(session.header.id, session.title)
+      }
       const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
       for (const snap of (await persistence?.list?.()) ?? []) {
         const header = headerOfSnapshot(snap)
@@ -1284,6 +1320,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         .map((h) => ({
           sessionId: h.id,
           createdAt: h.createdAt,
+          ...(liveTitles.get(h.id) ? { title: liveTitles.get(h.id) } : {}),
           ...(h.cwd ? { cwd: h.cwd } : {}),
           ...(h.agentPreset ? { agentPreset: h.agentPreset } : {}),
         }))
@@ -1502,6 +1539,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     allowModelOverride: config.allowModelOverride ?? DEFAULTS.allowModelOverride,
     preset: config.preset ?? DEFAULTS.preset,
     maxQueue: config.maxQueue ?? DEFAULTS.maxQueue,
+    taskTimeoutMs: config.taskTimeoutMs ?? DEFAULTS.taskTimeoutMs,
     taskTtlMs: config.taskTtlMs ?? DEFAULTS.taskTtlMs,
     maxAgents: config.maxAgents ?? DEFAULTS.maxAgents,
     sessionTtlMs: config.sessionTtlMs ?? DEFAULTS.sessionTtlMs,
@@ -1636,6 +1674,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         defaultDetail: runtimeConfig.defaultDetail,
         maxAgents: runtimeConfig.maxAgents,
         maxQueue: runtimeConfig.maxQueue,
+        taskTimeoutMs: runtimeConfig.taskTimeoutMs,
         sessionTtlMs: runtimeConfig.sessionTtlMs,
         authEnabled: runtimeConfig.authToken !== '',
         workspaceRoots: runtimeConfig.workspaceRoots,
@@ -1781,7 +1820,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     // 已有 session: GET/POST/DELETE 都路由到对应 transport(支持 SSE 流 + 会话终止)
     if (existing) {
       if (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE') {
-        await existing.handleRequest(req as never, res as never)
+        await existing.handleRequest(req, res)
         return
       }
       res.writeHead(405, { 'Content-Type': 'application/json' })
@@ -1818,8 +1857,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           connections.delete(sid)
         }
       }
-      await mcp.connect(transport as never)
-      await transport.handleRequest(req as never, res as never)
+      await mcp.connect(transport)
+      await transport.handleRequest(req, res)
       return
     }
 

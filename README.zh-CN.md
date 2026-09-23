@@ -155,6 +155,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 | `defaultDetail` | `summary` | `agent_run`/`task_result` 的默认详略级别（单次调用可用 `detail` 覆盖） |
 | `reattachOrphans` | `false` | 启动时把未分组会话补挂到工作区（批量写用户数据，默认关；`attach_session` 工具随时可用） |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
+| `taskTimeoutMs` | `0`（关闭） | agent turn 自动超时；到点走官方 `agent.cancel({kind:'hook'})`，结果 `error` 注明超时。长任务部署请调大或保持关闭 |
 | `sessionTtlMs` | `86400000`（24 小时） | 空闲超过该时长的 MCP 传输会话被服务端回收；客户端对旧会话 id 得到 404，按规范重新 initialize 即可（`0` = 永不回收） |
 
 每个任务结果都是**结构化**的：`sessionId / model / changes / verification / leftovers / error / toolCallCount …`（按 detail 分级投影）；`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果；空的 `error`/`taskId` 字段直接省略（不再是空串）。工具级失败（未知 `taskId`、覆盖被拒、服务不可用、cwd 越界、turn 失败）按 MCP 规范以 **`isError: true`** 的工具结果返回——严格客户端与模型无需解析载荷即可识别为失败。
@@ -198,11 +199,12 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 **0.5.0 补齐模型选择面**：`model_list`（官方目录 / `llm` 回退）、`agent_run`+`task_inbox` 的按调用覆盖、`select_model`（会话内换模型）、`reasoningEffort`、`allowModelOverride` 门禁、结果自报 `model`、会话池按 `cwd + 模型` 分组。
 **0.6.0 收紧 MCP 协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、GUI 面板显示会话 TTL。
 **0.7.0 补齐取消与可观测面**：`agent_run` 支持 MCP `notifications/cancelled` 取消（接宿主官方 `agent.cancel({kind:'user'})`），新增 `task_cancel` / `task_list` / `session_list`——队列可取消可列举、会话可发现，均为原先的 Roadmap 项。
+**0.8.0 收尾**：可选 `taskTimeoutMs` 自动超时（官方 hook 原因 cancel + error 注明）、`session_list` 回报 live 会话标题、GUI 队列统计细分失败/取消。
 
 仍然存在的限制：
 
 - [ ] 任务队列在进程内存中，进程重启丢失（后续可持久化）。
-- [ ] `agent_run` / `task_inbox` 无服务端**自动**超时——卡死的 agent 会占住该 cwd 的串行锁，后续同目录任务排队等待（调用方可主动取消：`agent_run` 用 MCP `notifications/cancelled`，队列任务用 `task_cancel`，但没有自动触发机制）。
+- [x] ~~无服务端自动超时~~——0.8.0 加了可选的 `taskTimeoutMs`（默认关闭）；调用方仍可主动取消（`agent_run` 用 MCP `notifications/cancelled`，队列任务用 `task_cancel`）。
 - [x] ~~队列不能列举/取消~~——0.7.0 已补（`task_list` / `task_cancel`）。
 - [x] ~~只读查询面不完整：没有 `session_list`~~——0.7.0 已补（列会话元数据；读完整历史仍是后续工作）。
 - [ ] `preset` 仍是部署级配置（一个 MCP server 实例一种 persona），不能按调用指定。
@@ -216,7 +218,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 ```bash
 npm install
 npm run build    # 独立构建(纯 tsc), 产出 lib/
-npm run smoke    # 端口 8099/8098/8096/8095/8094 假 ctx 冒烟(81 项, 真实 MCP 协议往返) + 端口冲突专项
+npm run smoke    # 端口 8099/8098/8096/8095/8094/8093 假 ctx 冒烟(84 项, 真实 MCP 协议往返) + 端口冲突专项
 ```
 
 真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md) 的方式起一个独立 profile，然后 `E2E_WITH_AGENT=1 node e2e.mjs`。

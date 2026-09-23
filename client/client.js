@@ -163,7 +163,7 @@ window.__ModuleLoader__.load({ id: 'dsh-ops-mcp', factory: (require) => {
         React.createElement('span', null, React.createElement('span', { style: S.metaKey }, '认证 '), cfg.authEnabled ? 'Bearer 已启用' : '未设置(仅本机)'),
         React.createElement('span', null, React.createElement('span', { style: S.metaKey }, '会话 TTL '), cfg.sessionTtlMs === 0 ? '不淘汰' : (cfg.sessionTtlMs ? fmtDur(cfg.sessionTtlMs) : '?')),
         React.createElement('span', null, React.createElement('span', { style: S.metaKey }, '常驻 Agent '), String(stats.liveAgents ?? 0)),
-        React.createElement('span', null, React.createElement('span', { style: S.metaKey }, '队列 '), ((stats.queue && stats.queue.active) || 0) + ' 活跃 / ' + ((stats.queue && stats.queue.done) || 0) + ' 完成'),
+        React.createElement('span', null, React.createElement('span', { style: S.metaKey }, '队列 '), ((stats.queue && stats.queue.active) || 0) + ' 活跃 / ' + ((stats.queue && stats.queue.done) || 0) + ' 完成 / ' + ((stats.queue && stats.queue.error) || 0) + ' 失败 / ' + ((stats.queue && stats.queue.cancelled) || 0) + ' 取消'),
       ),
       error ? React.createElement('div', { style: S.error }, '⚠ ', error) : null,
       // 连接列表

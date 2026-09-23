@@ -62,6 +62,12 @@ export interface Config {
     preset?: string;
     /** 任务队列容量上限(默认 100) */
     maxQueue?: number;
+    /**
+     * 任务自动超时毫秒数(默认 0 = 不启用)。agent turn 执行超过该时长即走官方
+     * agent.cancel({kind:'hook', reason:'task timeout'}), 结果 error 会注明超时。
+     * 长任务(大改动/长分析)部署请按需调大或保持关闭。
+     */
+    taskTimeoutMs?: number;
     /** 已完成任务保留毫秒数(默认 10 分钟) */
     taskTtlMs?: number;
     /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */

@@ -1,5 +1,6 @@
 // E2E verification against a REAL dsh host (not shipped; dev-only).
-// Zero-token phase: initialize / tools/list / echo / dsh_list_tools / model_list.
+// Zero-token phase: initialize / tools/list / echo / dsh_list_tools / model_list /
+// task_list / task_cancel wiring probe / session_list / select_model wiring probe.
 // Agent phase (E2E_WITH_AGENT=1): one minimal tool-using agent_run — verifies preset
 // mounting (toolCalls non-empty), local userMessage() acceptance, snapshotEvents
 // extraction, and the summary contract on a live agent-loop.
@@ -66,8 +67,8 @@ try {
 
   const toolsList = await rpc(sid, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
   const names = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
-  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'select_model', 'attach_session', 'rename_session']
-  report('tools/list 九工具齐(含 model_list/select_model)', expected.every((n) => names.includes(n)), names.join(','))
+  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'task_list', 'task_cancel', 'session_list', 'select_model', 'attach_session', 'rename_session']
+  report('tools/list 十二工具齐(含 model_list/select_model/task_*/session_list)', expected.every((n) => names.includes(n)), names.join(','))
 
   const echo = await rpc(sid, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'e2e-ping' } } })
   report('echo 往返', echo.status === 200 && echo.text.includes('e2e-ping'))
@@ -104,6 +105,22 @@ try {
   report('select_model 已接上官方 sessionController(不存在会话被拒)', probeInner.ok !== true && probeErr !== ''
     && !probeErr.includes('sessionController service unavailable'),
   probeErr.slice(0, 160))
+
+  // ── 队列/会话查询面(只读) + task_cancel 接线探针 ──
+  const taskList = await rpc(sid, { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'task_list', arguments: {} } })
+  const tl = innerOf(taskList)
+  report('task_list 返回数组', Array.isArray(tl), Array.isArray(tl) ? `${tl.length} 个任务` : String(tl.error).slice(0, 120))
+
+  const cancelProbe = await rpc(sid, { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'task_cancel', arguments: { taskId: 'e2e-nonexistent-task' } } })
+  const cancelPayload = parsePayload(cancelProbe.text).result
+  const cancelInner = innerOf(cancelProbe)
+  report('task_cancel 未知 taskId 以 isError 拒绝', cancelPayload?.isError === true && String(cancelInner.error ?? '').includes('task not found'),
+    String(cancelInner.error ?? '').slice(0, 120))
+
+  const sessionList = await rpc(sid, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'session_list', arguments: { limit: 5 } } })
+  const sl = innerOf(sessionList)
+  report('session_list 返回清单', !sl.error && Number.isInteger(sl.total) && Array.isArray(sl.sessions),
+    sl.error ? String(sl.error).slice(0, 120) : `total=${sl.total} 最新: ${sl.sessions.slice(0, 3).map((s) => String(s.sessionId).slice(0, 8)).join(',')}`)
 
   if (!WITH_AGENT) {
     console.log('\n(zero-token phase done; set E2E_WITH_AGENT=1 for the live agent_run leg)')
@@ -142,6 +159,10 @@ try {
       String(inner.assistantText).slice(0, 100).replace(/\n/g, ' '))
     report('summary 解析(changes/verification)', Boolean(inner.changes || inner.verification),
       `changes="${String(inner.changes).slice(0, 80)}"`)
+    const slAfter = innerOf(await rpc(sid, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'session_list', arguments: {} } }))
+    report('session_list 包含刚执行的会话(live 归并)', !slAfter.error
+      && slAfter.sessions?.some((s) => s.sessionId === inner.sessionId),
+      slAfter.error ? String(slAfter.error).slice(0, 120) : `total=${slAfter.total}`)
   }
   finish()
   }

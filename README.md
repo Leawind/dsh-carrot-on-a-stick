@@ -155,6 +155,7 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `defaultDetail` | `summary` | default detail level for `agent_run`/`task_result` (overridable per call via `detail`) |
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
+| `taskTimeoutMs` | `0` (off) | auto-timeout per agent turn; on expiry the host's official `agent.cancel({kind:'hook'})` fires and the result's `error` notes the timeout. Raise it for long-task deployments |
 | `sessionTtlMs` | `86400000` (24 h) | reap idle MCP transport sessions after this long; clients get 404 on the stale session id and re-initialize per the spec (`0` = never reap) |
 
 Every result is structured: `sessionId / model / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen. Empty `error`/`taskId` fields are omitted rather than sent as empty strings. Tool-level failures (unknown `taskId`, model override refused, service unavailable, cwd outside `workspaceRoots`, a turn that ended in error) come back as tool results **with `isError: true`** (the MCP-spec-recommended shape) — strict clients and models can recognize them without parsing the payload.
@@ -200,11 +201,12 @@ The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host 
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
 **0.6.0 tightened MCP-spec conformance**: tool errors now carry `isError: true`, an Origin-header check joins the DNS-rebinding guards, `401` includes a `WWW-Authenticate` challenge, tools expose `title` + `annotations`, idle transport sessions are reaped (`sessionTtlMs`), and the GUI panel shows the TTL.
 **0.7.0 completed the cancellation & observability surface**: `agent_run` honours the MCP `notifications/cancelled` (wired to the host's official `agent.cancel({kind:'user'})`), and new `task_cancel` / `task_list` / `session_list` tools make the queue listable+cancellable and sessions discoverable — both previously open roadmap items.
+**0.8.0 closed the last roadmap gap in this area**: optional `taskTimeoutMs` auto-timeout (official hook-cause cancel + `error` annotation), `session_list` surfaces live session titles, GUI queue stats split failed/cancelled.
 
 What remains:
 
 - [ ] The task queue lives in process memory; a restart loses it (persistence is future work).
-- [ ] No server-side timeout for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it (callers can cancel: MCP-level `notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks — but nothing fires automatically).
+- [x] ~~No server-side timeout for `agent_run` / `task_inbox`~~ — 0.8.0 added the opt-in `taskTimeoutMs` (off by default); callers can also cancel actively (`notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks).
 - [x] ~~The queue cannot be listed or cancelled either~~ — done in 0.7.0 (`task_list` / `task_cancel`).
 - [x] ~~Read-only query surface is still incomplete~~ — `session_list` (0.7.0) joins `attach_session` / `rename_session` / `select_model`; reading a session's full history is still future work.
 - [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
@@ -218,7 +220,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094 (81 checks, real MCP protocol round-trips)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093 (84 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
 
