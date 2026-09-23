@@ -17,7 +17,7 @@
 //  10. 取消与可观测: agent_run 经 notifications/cancelled 取消(官方 agent.cancel)、
 //      task_cancel/task_list 队列观测、session_list/session_history 查询面
 //  11. LRU 淘汰跳过活跃会话、并发压力、GUI 控制面路由(status/stop/start 同源门禁)
-import { realpathSync, unlinkSync } from 'node:fs'
+import { realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
 
@@ -878,6 +878,17 @@ try {
     checks['并发: 混合查询不受影响'] = listDuring.status === 200
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
+  }
+
+  // ── Phase M: 持久化文件损坏 —— 启动必须存活, 队列从空开始 ──
+  {
+    const badPath = resolve(FAKE_CWD, '.smoke-queue-bad.json')
+    writeFileSync(badPath, '{corrupted json', 'utf8')
+    const phaseM = await startPhase(8085, makeCtx({ llm: fakeLlm }), { queuePersistPath: badPath })
+    const tlM = innerOf(await phaseM.call('task_list', {}))
+    checks['持久化文件损坏: 启动存活且队列为空'] = Array.isArray(tlM) && tlM.length === 0
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    try { unlinkSync(badPath) } catch { /* 已清理 */ }
   }
 
   // ── Phase K: LRU 淘汰跳过活跃会话 —— maxAgents:1 时, 忙会话不被淘汰 dispose, 空闲会话才被逐出 ──
