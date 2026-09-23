@@ -1430,10 +1430,11 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       description: '列出已知会话的元数据(sessionId/创建时间/cwd/preset/当前模型)。live 与持久化合并、live 优先、按创建时间倒序; 模型选择仅 live/常驻池会话可知。用于挑选要续接(agent_run 的 sessionId)/改名/归组的会话。',
       inputSchema: {
         limit: z.number().int().min(1).max(100).optional().describe('最多返回条数(默认 20)'),
+        cwd: z.string().optional().describe('只列该目录(含子目录)下的会话'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ limit }) => {
+    async ({ limit, cwd }) => {
       // 与 reattachOrphanSessions 同款合并: live 优先, 持久化侧兼容快照/裸 header 两种形状
       const headers = new Map<string, SessionHeader>()
       const liveTitles = new Map<string, string>()
@@ -1448,7 +1449,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         const header = headerOfSnapshot(snap)
         if (header && !headers.has(header.id)) headers.set(header.id, header)
       }
+      // cwd 过滤: 过滤根目录 realpath 归一化后, 只留其(含子目录)下的会话
+      const filterRoot = cwd ? await canonicalCwd(resolve(cwd)) : undefined
       const items = [...headers.values()]
+        .filter((h) => (filterRoot ? h.cwd !== undefined && isWithin(filterRoot, h.cwd) : true))
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, limit ?? 20)
         .map((h) => {

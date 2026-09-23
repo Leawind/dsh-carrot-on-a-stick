@@ -314,6 +314,7 @@ try {
 
   const toolsList = await rpc(init.sid, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} })
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
+  checks['tools/list: 精确 13 个工具(无多余注册)'] = toolNames.length === 13
   checks['attach_session 在工具清单里'] = toolNames.includes('attach_session')
   checks['model_list / select_model 在工具清单里'] = toolNames.includes('model_list') && toolNames.includes('select_model')
   const echoTool = parsePayload(toolsList.text).result?.tools?.find((t) => t.name === 'echo')
@@ -554,6 +555,12 @@ try {
   const sessListLim = await rpc(init.sid, { jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'session_list', arguments: { limit: 2 } } })
   const slLim = sessListLim.status === 200 ? innerOf(sessListLim) : { total: 0, sessions: [] }
   checks['session_list: limit 截断且 total 不变'] = slLim.sessions.length === 2 && slLim.total === sl.total
+
+  const slFiltered = await rpc(init.sid, { jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'session_list', arguments: { cwd: resolve(FAKE_CWD, 'no-such-dir') } } })
+  const slF = slFiltered.status === 200 ? innerOf(slFiltered) : { sessions: [] }
+  checks['session_list: cwd 过滤(无匹配目录为空)'] = slF.total >= 3 && Array.isArray(slF.sessions) && slF.sessions.length === 0
+  const slAll = await rpc(init.sid, { jsonrpc: '2.0', id: 92, method: 'tools/call', params: { name: 'session_list', arguments: { cwd: FAKE_CWD } } })
+  checks['session_list: cwd 过滤(根目录全中)'] = slAll.status === 200 && innerOf(slAll).sessions.length === sl.total
 
   // ── session_history: live 会话纪要(从最新往回取, 时间正序返回) ──
   const histLive = await rpc(init.sid, { jsonrpc: '2.0', id: 72, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live' } } })
