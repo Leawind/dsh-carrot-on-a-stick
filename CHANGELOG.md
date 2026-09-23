@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0
+
+**MCP 协议一致性收紧**——对照 MCP 规范逐项审查后的修复与补齐（审查结论：核心生命周期/传输层
+经官方 SDK 严格合规，本次补齐剩余的字面偏差）：
+
+- **工具错误结果带 `isError: true`**（规范 SHOULD）：`task_inbox`（队列满）、`task_result`
+  （未知 `taskId`、失败任务轮询、失败任务取结果）、`select_model`（覆盖被禁/服务不可用/切换失败）、
+  `rename_session`（会话不存在/服务不可用）、`attach_session`（会话不存在/无 cwd/归组失败）
+  原先把 `{"error": …}` 当成功结果返回，严格客户端与模型无法识别为失败；现在载荷不变（仍是
+  JSON 文本），但整个结果带 `isError` 标记。`agent_run`/`task_result` 投影出的 `error` 非空时
+  同样标 `isError`（turn 失败透出对模型可见）。抛错路径（cwd 越界、模型无法解析等）本就经
+  SDK 包装为 `isError: true`，不变。
+- **Origin 头校验**（规范对本地 HTTP 服务的 MUST）：与 Host 白名单同一份 allowlist——浏览器
+  类请求带跨域 `Origin` 或解析失败值（如 `Origin: null`）一律 403；不发 Origin 的非浏览器
+  MCP 客户端不受影响。此前只有 Host 校验（等效缓解但非规范字面）。
+- **401 带 `WWW-Authenticate: Bearer` 挑战**（RFC 6750 / MCP 授权惯例）。
+- **非 `/mcp` 路径的 404 不再挪用 `-32601`**：路径门禁不属于 JSON-RPC 语义，响应体改为普通
+  错误对象 `{"error": "Not found: <path>"}`（状态码不变，客户端只看 404）。
+- **成功结果省略空 `error`/`taskId` 字段**：`agent_run`（同步，无 taskId）不再返回
+  `"error": ""`/`"taskId": ""` 空串噪音。
+- **工具元数据**：迁移到 `registerTool`，每个工具带 `title` 与 `annotations`
+  （2025-06-18 协议新增字段）——纯查询工具（`echo`/`dsh_list_tools`/`model_list`/`task_result`）
+  标 `readOnlyHint: true`，写类工具标 `readOnlyHint: false`，无破坏性的写（改模型/改名/归组）
+  加 `destructiveHint: false`。
+- **新配置 `sessionTtlMs`**（默认 24 小时，`0` = 永不）：空闲超时的 MCP 传输会话由服务端回收
+  （客户端异常退出不发 DELETE，transport/McpServer 此前会无限累积）；客户端对旧会话 id 得到
+  404，按规范重新 initialize 即可。GUI 面板同步显示"会话 TTL"。
+- **软停止等待 close 完成**：GUI"停止→启动"循环现在可靠（此前 `close()` 未等待，立即重启
+  可能撞上未释放的端口）。
+- 冒烟测试 57 → 72 项：isError 标记（4 处场景）、成功结果无 isError 且省略空字段、工具带
+  `title`+`annotations`、Origin 三态（跨域拒 / `null` 拒 / 同源放行）、401 带
+  WWW-Authenticate、404 体、会话 TTL 三连（TTL 内可用 / 超时 404 / 重新 initialize 恢复）。
+
 ## 0.5.0
 
 **模型选择面补齐**——原版只能用插件 config 在**部署级**定一个模型，调用方无法按任务/按会话选模型，也看不到有哪些可选。本次把三条路径接上，并保持"零宿主副本"原则：

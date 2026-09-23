@@ -62,6 +62,11 @@ export interface Config {
     taskTtlMs?: number;
     /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
     maxAgents?: number;
+    /**
+     * MCP 传输会话空闲 TTL 毫秒数(默认 24 小时, 0 = 永不淘汰)。
+     * 超时未活动的会话被服务端关闭, 客户端下次请求得 404 后按规范重新 initialize。
+     */
+    sessionTtlMs?: number;
     /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>, 常数时间比较) */
     authToken?: string;
     /** cwd 白名单(设置后 agent 只能在列出的目录下干活; 跨平台分隔符/大小写安全) */
