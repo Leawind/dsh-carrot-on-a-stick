@@ -35,7 +35,8 @@ const fakeWs = {
   title: 'fake',
   path: FAKE_CWD,
   sessionIds: [],
-  attachSession: async (id) => { attachedIds.push(id) },
+  // 真实跟踪花名册: attach_session 的幂等分支(已挂会话返回 attached:false)才有意义
+  attachSession: async (id) => { fakeWs.sessionIds.push(id); attachedIds.push(id) },
 }
 const wsRegistry = {
   list: () => [fakeWs],
@@ -306,18 +307,21 @@ try {
   checks['dsh_list_tools 经 schemas() 返回 name+description'] = Array.isArray(listToolsInner)
     && listToolsInner.some((t) => t.name === 'bash' && t.description === 'run a shell command')
 
-  // ── attach_session 工具(live / 持久化快照 / 旧版裸 header / 未知 四态) ──
-  const attachLive = await rpc(init.sid, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'attach_session', arguments: { sessionId: 'sess-live' } } })
-  checks['attach_session live 会话'] = attachLive.status === 200 && innerOf(attachLive).attached === true
+  // ── attach_session 工具(正面归组 / 幂等 / 持久化快照 / 旧版裸 header / 未知 四态) ──
+  const attachErr = await rpc(init.sid, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'attach_session', arguments: { sessionId: 'sess-err' } } })
+  checks['attach_session live 会话(sess-err 正面归组)'] = attachErr.status === 200 && innerOf(attachErr).attached === true
 
   const attachMissing = await rpc(init.sid, { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'attach_session', arguments: { sessionId: 'sess-nope' } } })
   checks['attach_session 未知会话报错'] = attachMissing.status === 200 && typeof innerOf(attachMissing).error === 'string'
 
+  // 存量捞回在启动时已把 sess-persisted / sess-legacy / sess-live 挂到工作区, 重复挂应幂等返回
   const attachPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'attach_session', arguments: { sessionId: 'sess-persisted' } } })
-  checks['attach_session 持久化会话(.header 快照)'] = attachPersisted.status === 200 && innerOf(attachPersisted).attached === true
+  checks['attach_session 持久化会话(.header 快照)'] = attachPersisted.status === 200 && innerOf(attachPersisted).attached === false
+    && String(innerOf(attachPersisted).note ?? '').includes('already attached')
 
   const attachLegacy = await rpc(init.sid, { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'attach_session', arguments: { sessionId: 'sess-legacy' } } })
-  checks['attach_session 旧版裸 header 形状'] = attachLegacy.status === 200 && innerOf(attachLegacy).attached === true
+  checks['attach_session 旧版裸 header 形状'] = attachLegacy.status === 200 && innerOf(attachLegacy).attached === false
+    && String(innerOf(attachLegacy).note ?? '').includes('already attached')
 
   // ── 任意会话续接三级 ──
   const runLive = await rpc(init.sid, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-live' } } })
