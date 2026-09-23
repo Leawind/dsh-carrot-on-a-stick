@@ -155,7 +155,16 @@ const fakeSessionController = {
   }),
   selectModel: async (request) => {
     selectModelCalls.push(request)
+    // 宿主对不可路由的模型直接拒绝(切换失败路径)
+    if (request.model === 'boom') throw new Error('model boom is not routable')
     return { selected: { ...request, sessionId: undefined } }
+  },
+}
+const fakeSessionTitle = {
+  renamed: [],
+  rename: (session, title) => {
+    fakeSessionTitle.renamed.push({ id: session?.id, title })
+    return { title }
   },
 }
 const fakeLlm = {
@@ -171,7 +180,7 @@ const fakeLlm = {
  * sessionController 只作为同名属性提供(证明 serviceOf 的属性回退可用, 也方便造"没有它"的部署)。
  * 提供假 webServer: 捕获 GUI 控制面注册的 handler, 供 Phase J 直接调用路由(同源校验/启停)。
  */
-function makeCtx({ sessionController, llm = {} } = {}) {
+function makeCtx({ sessionController, llm = {}, sessionTitle } = {}) {
   const webHandlers = new Map()
   const fakeWebServer = {
     register: ({ path, handler }) => {
@@ -221,12 +230,13 @@ function makeCtx({ sessionController, llm = {} } = {}) {
         : name === 'sessionPersistence' ? fakePersistence
           : name === 'tools' ? fakeTools
             : name === 'agentDefaultModel' ? fakeAgentDefaultModel
-              : undefined),
+              : name === 'sessionTitle' ? sessionTitle
+                : undefined),
   }
   return ctx
 }
 
-const ctx = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm })
+const ctx = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm, sessionTitle: fakeSessionTitle })
 
 const PORT = 8099
 const BASE = `http://127.0.0.1:${PORT}/mcp`
@@ -537,6 +547,19 @@ try {
   checks['session_history: 持久化-only 会话明确报不可读'] = parsePayload(histPersisted.text).result?.isError === true
     && String(innerOf(histPersisted).error ?? '').includes('not live')
 
+  // ── rename_session: 成功(走 sessionTitle 服务)与未知会话 ──
+  const renameOk = await rpc(init.sid, { jsonrpc: '2.0', id: 75, method: 'tools/call', params: { name: 'rename_session', arguments: { sessionId: 'sess-live', title: 'renamed-live' } } })
+  const renameOkInner = renameOk.status === 200 ? innerOf(renameOk) : {}
+  checks['rename_session: 成功改名(走 sessionTitle 服务)'] = renameOkInner.ok === true && renameOkInner.title === 'renamed-live'
+    && fakeSessionTitle.renamed.at(-1)?.id === 'sess-live'
+  const renameMissing = await rpc(init.sid, { jsonrpc: '2.0', id: 76, method: 'tools/call', params: { name: 'rename_session', arguments: { sessionId: 'sess-nope' } } })
+  checks['rename_session: 未知会话带 isError'] = parsePayload(renameMissing.text).result?.isError === true
+
+  // select_model 切换失败(宿主 selectModel 抛错) → isError 且透出宿主原因
+  const selFail = await rpc(init.sid, { jsonrpc: '2.0', id: 77, method: 'tools/call', params: { name: 'select_model', arguments: { sessionId: 'sess-live', provider: 'p2', model: 'boom' } } })
+  checks['select_model: 宿主切换失败透出原因(isError)'] = parsePayload(selFail.text).result?.isError === true
+    && String(innerOf(selFail).error ?? '').includes('boom is not routable')
+
   // 卸载 Phase B(清空池/队列/server), 再起 Phase A
   for (const d of disposers.splice(0)) {
     if (typeof d === 'function') d()
@@ -686,6 +709,10 @@ try {
 
   const selNoSc = innerOf(await phaseC.call('select_model', { sessionId: 'sess-live', provider: 'p2', model: 'm9' }))
   checks['无 sessionController 时 select_model 明确报不可用'] = String(selNoSc.error ?? '').includes('sessionController service unavailable')
+
+  // Phase C 的假 ctx 没有 sessionTitle 服务: rename_session 明确报不可用
+  const renameNoSc = innerOf(await phaseC.call('rename_session', { sessionId: 'sess-live', title: 'x' }))
+  checks['无 sessionTitle 时 rename_session 明确报不可用'] = String(renameNoSc.error ?? '').includes('sessionTitle service unavailable')
 
   for (const d of disposers.splice(0)) if (typeof d === 'function') d()
   await new Promise((r) => setTimeout(r, 200))
