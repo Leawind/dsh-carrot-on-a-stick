@@ -131,6 +131,8 @@ cancel via the standard `notifications/cancelled` (both wired to the host agent'
 
 ## Install & run
 
+Requires the dsh host to run on **Node.js >= 18** (the plugin declares `engines` accordingly).
+
 The plugin must be installed into a dsh **profile directory** (the loader resolves plugin names from there; `--patch` alone from a repo checkout will not find the local package — see finding 1 in the [E2E report](./docs/e2e-0.1.5-rc.2.zh.md)):
 
 ```bash
