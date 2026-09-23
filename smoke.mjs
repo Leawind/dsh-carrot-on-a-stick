@@ -933,6 +933,43 @@ try {
     await new Promise((r) => setTimeout(r, 150))
   }
 
+  // ── Phase N: 官方 SDK Client 对接 —— 用参考客户端实现验证握手/工具调用/进度/超时取消全链路 ──
+  {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js')
+    const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js')
+    const ctxN = makeCtx({ llm: fakeLlm })
+    const PORT_N = 8084
+    await apply(ctxN, { port: PORT_N, host: '127.0.0.1', progressIntervalMs: 300 })
+    await new Promise((r) => setTimeout(r, 200))
+    const client = new Client({ name: 'smoke-sdk-client', version: '1.0' })
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT_N}/mcp`))
+    await client.connect(transport)
+
+    const { tools } = await client.listTools()
+    checks['SDK Client: listTools 返回 13 工具'] = tools.length === 13
+    const echoRes = await client.callTool({ name: 'echo', arguments: { text: 'sdk-ping' } })
+    checks['SDK Client: echo 往返'] = String(echoRes.content?.[0]?.text ?? '').includes('sdk-ping')
+
+    // 长任务 + onprogress(官方进度回调) + timeout(客户端超时自动发 cancelled → 服务端官方 cancel)
+    const progressEvents = []
+    try {
+      await client.callTool(
+        { name: 'agent_run', arguments: { task: 'long job', sessionId: 'sess-slow' } },
+        undefined,
+        { timeout: 2000, onprogress: (p) => progressEvents.push(p) },
+      )
+    } catch {
+      // 客户端超时: SDK 自动发 cancelled 并在本地 reject
+    }
+    checks['SDK Client: onprogress 收到进度心跳'] = progressEvents.length >= 2
+      && progressEvents.every((p) => typeof p.progress === 'number')
+    await new Promise((r) => setTimeout(r, 400)) // 等服务端收敛
+    checks['SDK Client: 超时触发服务端官方 agent.cancel'] = slowLiveAgent.cancelCalls.length >= 1
+    await client.close()
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
   // ── Phase M: 持久化文件损坏 —— 启动必须存活, 队列从空开始 ──
   {
     const badPath = resolve(FAKE_CWD, '.smoke-queue-bad.json')
