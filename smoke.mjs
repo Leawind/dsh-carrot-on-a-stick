@@ -324,6 +324,14 @@ try {
   const toolsList = await rpc(init.sid, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} })
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
   checks['tools/list: 精确 13 个工具(无多余注册)'] = toolNames.length === 13
+
+  // 协议版本协商: 旧版(2025-03-26 主流程已验) + 新版(2025-06-18 / 2025-11-25)均可接入
+  for (const [pv, pid] of [['2025-06-18', 93], ['2025-11-25', 94]]) {
+    const r = await rpc(undefined, { jsonrpc: '2.0', id: pid, method: 'initialize', params: { protocolVersion: pv, capabilities: {}, clientInfo: { name: 'smoke-pv', version: '1.0' } } })
+    const negotiated = r.status === 200 ? parsePayload(r.text).result?.protocolVersion : undefined
+    checks[`协议版本协商 ${pv}`] = negotiated === pv
+    await rpc(r.sid, { jsonrpc: '2.0', method: 'notifications/initialized' })
+  }
   checks['attach_session 在工具清单里'] = toolNames.includes('attach_session')
   checks['model_list / select_model 在工具清单里'] = toolNames.includes('model_list') && toolNames.includes('select_model')
   const echoTool = parsePayload(toolsList.text).result?.tools?.find((t) => t.name === 'echo')
