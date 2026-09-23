@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.7'
+const PLUGIN_VERSION = '0.11.8'
 
 /**
  * 声明依赖的核心服务。
@@ -726,13 +726,15 @@ function extractTexts(value: unknown, out: string[] = []): string[] {
 }
 
 /**
- * 会话事件 → 轮次纪要(从最新往回取 limit 条, 返回时按时间正序排列)。
+ * 会话事件 → 轮次纪要(从 newest 往回取 limit 条, 返回时按时间正序排列)。
+ * beforeIndex: 只考虑序号小于该值的事件——配合上次结果的最早 index 实现向更早翻页。
  * 事件形状与 executeTask 的解析一致: assistant/message, user/message, tool/call, tool/result, turn/end。
  * 长文本按角色截断, 防止整段历史灌穿调用方上下文。
  */
-function historyTurnsOf(events: readonly unknown[], limit: number): Record<string, unknown>[] {
+function historyTurnsOf(events: readonly unknown[], limit: number, beforeIndex?: number): Record<string, unknown>[] {
   const turns: Record<string, unknown>[] = []
-  for (let i = events.length - 1; i >= 0 && turns.length < limit; i--) {
+  const start = Math.min(beforeIndex ?? events.length, events.length)
+  for (let i = start - 1; i >= 0 && turns.length < limit; i--) {
     const ev = events[i] as { type?: string; data?: unknown } | undefined
     if (ev?.type === 'assistant/message') {
       const d = ev.data as { message?: { content?: { type?: string; text?: string }[] } } | undefined
@@ -1469,21 +1471,22 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     'session_history',
     {
       title: 'Session history',
-      description: '读取一个 live 会话的对话纪要(user/assistant/tool_call/tool_result/turn_end 轮次, 从最新往回取, 文本截断)。只支持内存中的 live 会话; 已持久化但不在内存的会话, 宿主未暴露整日志加载 API, 无法读取。',
+      description: '读取一个 live 会话的对话纪要(user/assistant/tool_call/tool_result/turn_end 轮次, 从最新往回取, 文本截断)。支持 beforeIndex 向更早翻页(上次结果最早的 index)。只支持内存中的 live 会话; 已持久化但不在内存的会话, 宿主未暴露整日志加载 API, 无法读取。',
       inputSchema: {
         sessionId: z.string().describe('会话 id(live; 来自 agent_run 结果或 session_list)'),
         limit: z.number().int().min(1).max(50).optional().describe('最多返回轮数(默认 10)'),
+        beforeIndex: z.number().int().min(0).optional().describe('从该事件序号之前往回取(翻页: 传上次结果最早的 index)'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ sessionId, limit }) => {
+    async ({ sessionId, limit, beforeIndex }) => {
       const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
       const session = sessions?.get?.(sessionId)
       if (!session) {
         return outError(JSON.stringify({ error: `session not live: ${sessionId} (persisted-only sessions cannot be read back; host does not expose a full-log load API)` }))
       }
       const events = eventsOf(session)
-      return out(JSON.stringify({ sessionId, totalEvents: events.length, turns: historyTurnsOf(events, limit ?? 10) }))
+      return out(JSON.stringify({ sessionId, totalEvents: events.length, turns: historyTurnsOf(events, limit ?? 10, beforeIndex) }))
     },
   )
 
