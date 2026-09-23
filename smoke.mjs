@@ -595,6 +595,11 @@ try {
   checks['Origin 同源主机放行(端口不参与比对)'] = sameOriginReq.status === 200
   await sameOriginReq.text()
 
+  // 超大载荷: content-length 声明超限的 POST 直接 413, 不进入传输层
+  const bigBody = JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'echo', arguments: { text: 'x'.repeat(10 * 1024 * 1024 + 1) } } })
+  const bigPost = await rawRequest(PORT_A, { headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekrit-token', Host: '127.0.0.1' }, body: bigBody })
+  checks['请求体上限: 超大 POST 被 413'] = bigPost.status === 413
+
   const strayPath = await rawRequest(PORT_A, { path: '/other', headers: { Authorization: 'Bearer sekrit-token', Host: '127.0.0.1' } })
   checks['路径门禁: 非 /mcp 路径 404'] = strayPath.status === 404
   checks['404 体为普通错误对象(不挪用 -32601)'] = (() => {
