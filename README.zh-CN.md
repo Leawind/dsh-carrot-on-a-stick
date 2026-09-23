@@ -205,6 +205,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 **0.8.0 收尾**：可选 `taskTimeoutMs` 自动超时（官方 hook 原因 cancel + error 注明）、`session_list` 回报 live 会话标题、GUI 队列统计细分失败/取消。
 **0.9.0 可选队列持久化**（`queuePersistPath`）：任务状态跨重启保留——已完成结果仍可取回、排队任务重新执行、被打断的如实上报；`running` 状态改为真正开始执行才标记，`task_list` 的排队/执行中从此精确。
 **0.10.0 补齐交互面**：`agent_run` 支持 `notifications/progress` 心跳（规范 `_meta.progressToken`），新增只读 `session_history` 读 live 会话纪要。协议审查报告见 [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md)。
+**0.11.0 会话模型可见性**：`session_list` 回报各会话当前模型选择（已知时），续接前即可确认"这个会话在用哪个模型"。
 
 仍然存在的限制：
 

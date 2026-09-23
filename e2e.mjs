@@ -132,8 +132,8 @@ try {
     finish()
   } else {
 
-  // ── agent 阶段: 一次最小的真实任务(一条列目录命令 + 行内 JSON 总结) ──
-  console.log(`\nagent_run: cwd=${CWD} (timeout ${AGENT_TIMEOUT_MS}ms)`)
+  // ── agent 阶段: 一次最小的真实任务(一条列目录命令 + 行内 JSON 总结), 带 progressToken 验证心跳 ──
+  console.log(`\nagent_run: cwd=${CWD} (timeout ${AGENT_TIMEOUT_MS}ms, progressToken=pt-e2e)`)
   const t0 = Date.now()
   const runPromise = rpc(sid, {
     jsonrpc: '2.0', id: 5, method: 'tools/call',
@@ -144,8 +144,10 @@ try {
         cwd: CWD,
         title: 'dsh-ops-mcp e2e',
       },
+      _meta: { progressToken: 'pt-e2e' },
     },
   })
+  // agent_run 可能跑几十秒: rpc() 返回的 text 是完整 SSE 体, 进度心跳行就在其中, 最后统一解析
   const timer = new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), AGENT_TIMEOUT_MS))
   const run = await Promise.race([runPromise, timer])
   if (run.timeout) {
@@ -155,6 +157,12 @@ try {
   const inner = run.status === 200 ? innerOf(run) : { error: `HTTP ${run.status}` }
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   report('agent_run 返回无错误', !inner.error, inner.error ? String(inner.error).slice(0, 200) : `${secs}s`)
+  const progressMsgs = run.text.split('\n')
+    .filter((l) => l.startsWith('data: '))
+    .map((l) => { try { return JSON.parse(l.slice(6)) } catch { return null } })
+    .filter((m) => m?.method === 'notifications/progress' && m.params?.progressToken === 'pt-e2e')
+  report('progress 心跳在真实任务期间到达', progressMsgs.length >= 1,
+    `${progressMsgs.length} 次: ${progressMsgs.slice(-1)[0]?.params?.message ?? '(无)'}`)
   if (!inner.error) {
     report('sessionId 存在', typeof inner.sessionId === 'string' && inner.sessionId.length > 0, String(inner.sessionId).slice(0, 40))
     report('toolCalls 非空(preset 挂载成功)', Array.isArray(inner.toolCalls) && inner.toolCalls.length > 0,
