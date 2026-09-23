@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.3'
+const PLUGIN_VERSION = '0.11.4'
 
 /**
  * 声明依赖的核心服务。
@@ -1658,6 +1658,9 @@ function jsonrpcError(code: number, message: string): string {
   return JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id: null })
 }
 
+/** MCP POST 请求体上限(字节): 正常任务/上下文远小于此, 413 拒绝失控载荷防进程内存被打爆 */
+const MAX_BODY_BYTES = 10 * 1024 * 1024
+
 /** Bearer token 常数时间比较(长度不等直接拒, 相等走 timingSafeEqual) */
 function bearerOk(req: http.IncomingMessage): boolean {
   if (!runtimeConfig.authToken) return true
@@ -2018,6 +2021,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (!originOk(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' })
       res.end(jsonrpcError(-32001, `Origin not allowed: ${String(req.headers.origin)}`))
+      return
+    }
+    // 请求体上限: 声明超过上限的 POST 先排空请求体再回 413(不进入传输层读体;
+    // 排空是为了客户端拿到完整响应而非连接被重置)
+    const contentLength = Number(req.headers['content-length'] ?? 0)
+    if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
+      req.resume()
+      res.writeHead(413, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: `Payload too large: ${contentLength} bytes > ${MAX_BODY_BYTES}` }))
       return
     }
     // 只服务 /mcp 端点, 其余路径 404(不给扫描器留面)。非 JSON-RPC 场景, 响应体用普通错误对象。
