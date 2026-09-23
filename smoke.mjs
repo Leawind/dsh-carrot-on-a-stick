@@ -11,6 +11,9 @@
 //   8. 模型选择: model_list(sessionController 官方目录 / llm 回退 / provider 过滤 / 投影省上下文)、
 //      agent_run+task_inbox 的 provider/model/reasoningEffort 覆盖、池按 cwd+模型分组、
 //      select_model 走官方 selectModel 并 re-key、allowModelOverride:false 门禁
+//   9. 协议严格性: 工具错误结果带 isError(MCP 规范 SHOULD)、成功结果省略空 error/taskId、
+//      工具带 title+annotations(2025-06-18 字段)、401 带 WWW-Authenticate、
+//      Origin 白名单(跨域/null 拒, 同源放行)、404 体不再挪用 -32601、会话空闲 TTL GC
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -247,6 +250,8 @@ try {
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
   checks['attach_session 在工具清单里'] = toolNames.includes('attach_session')
   checks['model_list / select_model 在工具清单里'] = toolNames.includes('model_list') && toolNames.includes('select_model')
+  const echoTool = parsePayload(toolsList.text).result?.tools?.find((t) => t.name === 'echo')
+  checks['工具带 title + annotations(2025-06-18 协议字段)'] = echoTool?.title === 'Echo' && echoTool?.annotations?.readOnlyHint === true
 
   // ── dsh_list_tools 走 schemas() ──
   const listTools = await rpc(init.sid, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'dsh_list_tools', arguments: {} } })
@@ -276,6 +281,9 @@ try {
     && Array.isArray(runLiveInner.toolCallNames) && runLiveInner.toolCallNames[0] === 'bash'
     && typeof runLiveInner.assistantTail === 'string' && runLiveInner.assistantTail.includes('c1')
     && runLiveInner.detail === 'summary'
+  // 成功结果: 不带 isError, 空 error/taskId 字段直接省略
+  checks['成功结果不带 isError'] = parsePayload(runLive.text).result?.isError === undefined
+  checks['成功结果省略空 error/taskId 字段'] = runLiveInner.error === undefined && runLiveInner.taskId === undefined
 
   const runPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-persisted', detail: 'full' } } })
   const runPersistedInner = runPersisted.status === 200 ? innerOf(runPersisted) : { error: 'bad' }
@@ -289,10 +297,11 @@ try {
   const runUnknown = await rpc(init.sid, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-unknown' } } })
   checks['agent_run 未知会话明确报错'] = runUnknown.status === 200 && String(innerOf(runUnknown).error ?? '').includes('session not found for resume')
 
-  // 失败透出: turn/end error 进 result.error(E2E 发现的静默空结果缺陷)
+  // 失败透出: turn/end error 进 result.error(E2E 发现的静默空结果缺陷), 且整个结果带 isError 标记
   const runErr = await rpc(init.sid, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'boom', sessionId: 'sess-err' } } })
   const runErrInner = runErr.status === 200 ? innerOf(runErr) : { error: 'bad' }
   checks['agent_run 失败透出(turn/end error)'] = String(runErrInner.error ?? '').includes('AUTH') && String(runErrInner.error ?? '').includes('invalid api key')
+  checks['agent_run 失败结果带 isError 标记'] = parsePayload(runErr.text).result?.isError === true
 
   // ── 异步队列: status 轮询不注入 payload, 完成后默认 summary ──
   const inbox = await rpc(init.sid, { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'queued job' } } })
@@ -306,6 +315,10 @@ try {
   const smFetch = await rpc(init.sid, { jsonrpc: '2.0', id: 17, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: queuedId } } })
   const smFetchInner = smFetch.status === 200 ? innerOf(smFetch) : { error: 'bad' }
   checks['task_result 默认 summary 投影'] = smFetchInner.changes === 'c1' && smFetchInner.toolCallNames?.[0] === 'bash' && smFetchInner.toolResults === undefined
+
+  // 未知 taskId: 错误结果带 isError 标记(MCP 规范: 工具执行错误在 result 里表达, 不走协议级错误)
+  const missingTask = await rpc(init.sid, { jsonrpc: '2.0', id: 18, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: 'nope' } } })
+  checks['错误结果带 isError 标记(task_result 未知 taskId)'] = parsePayload(missingTask.text).result?.isError === true
 
   // 事件读取走 snapshotEvents + 结构化解析
   checks['结构化解析(toolCalls/changes/verification)'] = runPersistedInner.toolCalls?.length === 1
@@ -418,6 +431,7 @@ try {
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0' } } }),
   })
   checks['authToken: 无 Bearer 被 401'] = unauth.status === 401
+  checks['401 带 WWW-Authenticate: Bearer 挑战'] = String(unauth.headers.get('www-authenticate') ?? '').startsWith('Bearer')
   await unauth.text()
 
   const authOk = await fetch(BASE_A, {
@@ -435,8 +449,39 @@ try {
   })
   checks['Host 白名单: 非 allowlist 主机名被 403'] = evilHost.status === 403
 
+  // Origin 校验(MCP 规范: 本地 HTTP 服务校验 Origin 防 DNS rebinding): 不带 Origin 的 MCP 客户端不受影响
+  const evilOrigin = await rawRequest(PORT_A, {
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekrit-token', Host: '127.0.0.1', Origin: 'http://evil.example' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/list', params: {}, ...(sidA ? { 'Mcp-Session-Id': sidA } : {}) }),
+  })
+  checks['Origin 白名单: 跨域 Origin 被 403'] = evilOrigin.status === 403
+
+  const nullOrigin = await rawRequest(PORT_A, {
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekrit-token', Host: '127.0.0.1', Origin: 'null' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list', params: {}, ...(sidA ? { 'Mcp-Session-Id': sidA } : {}) }),
+  })
+  checks['Origin: null 被拒(无法证明同源)'] = nullOrigin.status === 403
+
+  const sameOriginReq = await fetch(BASE_A, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
+      Authorization: 'Bearer sekrit-token', Origin: `http://127.0.0.1:${PORT_A}`,
+      ...(sidA ? { 'Mcp-Session-Id': sidA } : {}),
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/list', params: {} }),
+  })
+  checks['Origin 同源主机放行(端口不参与比对)'] = sameOriginReq.status === 200
+  await sameOriginReq.text()
+
   const strayPath = await rawRequest(PORT_A, { path: '/other', headers: { Authorization: 'Bearer sekrit-token', Host: '127.0.0.1' } })
   checks['路径门禁: 非 /mcp 路径 404'] = strayPath.status === 404
+  checks['404 体为普通错误对象(不挪用 -32601)'] = (() => {
+    try {
+      const body = JSON.parse(strayPath.text)
+      return body.error === 'Not found: /other' && !strayPath.text.includes('-32601')
+    } catch { return false }
+  })()
 
   async function rpcA(sessionId, body) {
     const res = await fetch(BASE_A, {
@@ -518,11 +563,30 @@ try {
   const deniedRun = innerOf(await phaseD.call('agent_run', { task: 'say ok', cwd: FAKE_CWD, provider: 'p2', model: 'm9' }))
   checks['allowModelOverride:false 时按调用选模型被拒'] = String(deniedRun.error ?? '').includes('allowModelOverride')
 
-  const deniedSel = innerOf(await phaseD.call('select_model', { sessionId: 'sess-live', provider: 'p2', model: 'm9' }))
+  const deniedSelResp = await phaseD.call('select_model', { sessionId: 'sess-live', provider: 'p2', model: 'm9' })
+  const deniedSel = innerOf(deniedSelResp)
   checks['allowModelOverride:false 时 select_model 被拒'] = String(deniedSel.error ?? '').includes('allowModelOverride')
+  checks['被拒结果带 isError 标记(select_model)'] = parsePayload(deniedSelResp.text).result?.isError === true
 
   const allowedRun = innerOf(await phaseD.call('agent_run', { task: 'say ok', cwd: FAKE_CWD }))
-  checks['allowModelOverride:false 不影响不带覆盖的调用'] = Boolean(allowedRun.sessionId) && allowedRun.error === ''
+  checks['allowModelOverride:false 不影响不带覆盖的调用'] = Boolean(allowedRun.sessionId) && !allowedRun.error
+    && allowedRun.error === undefined // 空 error 字段直接省略(不再是空串)
+
+  // ── Phase E: 会话空闲 TTL GC —— 超时无活动的会话被服务端关闭, 旧 sid 得 404, 重新 initialize 即可恢复 ──
+  const phaseE = await startPhase(8094, makeCtx({ llm: fakeLlm }), { sessionTtlMs: 400 })
+  const inTtl = await phaseE.call('model_list', {})
+  checks['TTL: 会话在 TTL 内可用'] = inTtl.status === 200
+  // sweeper 间隔 = min(60s, ttl/2) = 200ms; 等 1.3s 确保 400ms 空闲的会话被清扫
+  await new Promise((r) => setTimeout(r, 1300))
+  const stale = await phaseE.call('echo', { text: 'after-ttl' })
+  checks['TTL: 空闲超时会话被关闭(旧 sid 404)'] = stale.status === 404
+  const reInit = await fetch('http://127.0.0.1:8094/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-ttl', version: '1.0' } } }),
+  })
+  checks['TTL: 客户端可重新 initialize 建新会话'] = reInit.status === 200 && Boolean(reInit.headers.get('mcp-session-id'))
+  await reInit.text()
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [checkName, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${checkName}`)

@@ -136,6 +136,7 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
         # provider: ''                     # pair with model; empty = follow host default
         # reasoningEffort: ''              # default reasoning effort (empty = adapter default)
         # allowModelOverride: true         # false = pin the model, refuse caller overrides
+        # sessionTtlMs: 86400000           # idle MCP transport sessions are reaped after this (0 = never)
 ```
 
 | Field | Default | Meaning |
@@ -151,8 +152,9 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 | `defaultDetail` | `summary` | default detail level for `agent_run`/`task_result` (overridable per call via `detail`) |
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
+| `sessionTtlMs` | `86400000` (24 h) | reap idle MCP transport sessions after this long; clients get 404 on the stale session id and re-initialize per the spec (`0` = never reap) |
 
-Every result is structured: `sessionId / model / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen.
+Every result is structured: `sessionId / model / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen. Empty `error`/`taskId` fields are omitted rather than sent as empty strings. Tool-level failures (unknown `taskId`, model override refused, service unavailable, cwd outside `workspaceRoots`, a turn that ended in error) come back as tool results **with `isError: true`** (the MCP-spec-recommended shape) — strict clients and models can recognize them without parsing the payload.
 
 ## Zero host copies
 
@@ -173,7 +175,13 @@ construction uses a local, field-for-field equivalent of the host's `createUserM
 3. Never bind `0.0.0.0` or expose to LAN/WAN without a reverse proxy + TLS + auth.
 
 Built-in guards: a Host-header allowlist (bind host + loopback aliases by default, guarding against
-DNS rebinding; a missing Host header gets 400) and a `/mcp`-only HTTP surface (everything else 404).
+DNS rebinding; a missing Host header gets 400), an Origin-header check on the same allowlist
+(requests that carry a cross-origin or unparseable `Origin` — e.g. `Origin: null` — get 403;
+non-browser MCP clients that send no Origin are unaffected), a `/mcp`-only HTTP surface (everything
+else 404), `401` answers with a `WWW-Authenticate: Bearer` challenge, and idle transport sessions
+are reaped after `sessionTtlMs` (24 h default). Tools also carry spec-metadata (`title`,
+`annotations.readOnlyHint` etc., the 2025-06-18 protocol fields) so clients can label and
+sandbox-check them.
 
 ## Provenance
 
@@ -187,6 +195,7 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
+**0.6.0 tightened MCP-spec conformance**: tool errors now carry `isError: true`, an Origin-header check joins the DNS-rebinding guards, `401` includes a `WWW-Authenticate` challenge, tools expose `title` + `annotations`, idle transport sessions are reaped (`sessionTtlMs`), and the GUI panel shows the TTL.
 
 What remains:
 
@@ -204,7 +213,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095 (57 checks, real MCP protocol round-trips)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094 (72 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
 

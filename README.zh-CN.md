@@ -136,6 +136,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
         # provider: ''                     # 与 model 成对; 空 = 跟随宿主默认
         # reasoningEffort: ''              # 默认推理强度(空 = 适配器默认)
         # allowModelOverride: true         # false = 锁死模型, 拒绝调用方的覆盖
+        # sessionTtlMs: 86400000           # 空闲 MCP 传输会话超过该时长即被回收(0 = 永不)
 ```
 
 | 字段 | 默认值 | 含义 |
@@ -151,8 +152,9 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 | `defaultDetail` | `summary` | `agent_run`/`task_result` 的默认详略级别（单次调用可用 `detail` 覆盖） |
 | `reattachOrphans` | `false` | 启动时把未分组会话补挂到工作区（批量写用户数据，默认关；`attach_session` 工具随时可用） |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
+| `sessionTtlMs` | `86400000`（24 小时） | 空闲超过该时长的 MCP 传输会话被服务端回收；客户端对旧会话 id 得到 404，按规范重新 initialize 即可（`0` = 永不回收） |
 
-每个任务结果都是**结构化**的：`sessionId / model / changes / verification / leftovers / error / toolCallCount …`（按 detail 分级投影）；`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果。
+每个任务结果都是**结构化**的：`sessionId / model / changes / verification / leftovers / error / toolCallCount …`（按 detail 分级投影）；`error` 承接 turn 的非正常收场（模型调用失败/取消/blocked），不会再出现"成功"的空结果；空的 `error`/`taskId` 字段直接省略（不再是空串）。工具级失败（未知 `taskId`、覆盖被拒、服务不可用、cwd 越界、turn 失败）按 MCP 规范以 **`isError: true`** 的工具结果返回——严格客户端与模型无需解析载荷即可识别为失败。
 
 ## 零宿主副本
 
@@ -173,7 +175,11 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 3. 不要绑定 `0.0.0.0` 或暴露到局域网/公网，除非前面有反代 + TLS + 认证。
 
 内置防护：Host 头白名单（默认绑定地址 + loopback 别名，防 DNS rebinding，缺失 Host 400）；
-HTTP 入口只服务 `/mcp`，其余路径 404。
+同一白名单上的 Origin 头校验（带跨域或非法 `Origin`——如 `Origin: null`——一律 403；不发 Origin
+的非浏览器 MCP 客户端不受影响）；HTTP 入口只服务 `/mcp`，其余路径 404；401 响应带
+`WWW-Authenticate: Bearer` 挑战；空闲传输会话超过 `sessionTtlMs`（默认 24 小时）自动回收。
+工具同时携带协议元数据（`title`、`annotations.readOnlyHint` 等，2025-06-18 协议字段），
+便于客户端标注与沙箱判断。
 
 ## 源码来源
 
@@ -187,6 +193,7 @@ HTTP 入口只服务 `/mcp`，其余路径 404。
 
 0.2.0 Roadmap 的兼容性问题已在 0.3.0 处理；**0.3.1 完成真机 E2E 验证**（全绿，见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)），并修复 E2E 发现的问题：`{{model}}` 提示词变量（模型选择现经 `agentDefaultModel` 补全）、turn 失败透出、池会话 flush、存量捞回默认关闭、安装流程文档修正。
 **0.5.0 补齐模型选择面**：`model_list`（官方目录 / `llm` 回退）、`agent_run`+`task_inbox` 的按调用覆盖、`select_model`（会话内换模型）、`reasoningEffort`、`allowModelOverride` 门禁、结果自报 `model`、会话池按 `cwd + 模型` 分组。
+**0.6.0 收紧 MCP 协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、GUI 面板显示会话 TTL。
 
 仍然存在的限制：
 
@@ -204,7 +211,7 @@ HTTP 入口只服务 `/mcp`，其余路径 404。
 ```bash
 npm install
 npm run build    # 独立构建(纯 tsc), 产出 lib/
-npm run smoke    # 端口 8099/8098/8096/8095 假 ctx 冒烟(57 项, 真实 MCP 协议往返) + 端口冲突专项
+npm run smoke    # 端口 8099/8098/8096/8095/8094 假 ctx 冒烟(72 项, 真实 MCP 协议往返) + 端口冲突专项
 ```
 
 真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md) 的方式起一个独立 profile，然后 `E2E_WITH_AGENT=1 node e2e.mjs`。
