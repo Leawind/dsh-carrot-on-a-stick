@@ -14,6 +14,9 @@
 //   9. 协议严格性: 工具错误结果带 isError(MCP 规范 SHOULD)、成功结果省略空 error/taskId、
 //      工具带 title+annotations(2025-06-18 字段)、401 带 WWW-Authenticate、
 //      Origin 白名单(跨域/null 拒, 同源放行)、404 体不再挪用 -32601、会话空闲 TTL GC
+//  10. 取消与可观测: agent_run 经 notifications/cancelled 取消(官方 agent.cancel)、
+//      task_cancel/task_list 队列观测、session_list/session_history 查询面
+//  11. LRU 淘汰跳过活跃会话、并发压力、GUI 控制面路由(status/stop/start 同源门禁)
 import { realpathSync, unlinkSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -180,7 +183,7 @@ const fakeLlm = {
  * sessionController 只作为同名属性提供(证明 serviceOf 的属性回退可用, 也方便造"没有它"的部署)。
  * 提供假 webServer: 捕获 GUI 控制面注册的 handler, 供 Phase J 直接调用路由(同源校验/启停)。
  */
-function makeCtx({ sessionController, llm = {}, sessionTitle } = {}) {
+function makeCtx({ sessionController, llm = {}, sessionTitle, tools = fakeTools } = {}) {
   const webHandlers = new Map()
   const fakeWebServer = {
     register: ({ path, handler }) => {
@@ -189,7 +192,7 @@ function makeCtx({ sessionController, llm = {}, sessionTitle } = {}) {
     },
   }
   const ctx = {
-    tools: fakeTools,
+    tools,
     llm,
     sessionController,
     agents: {
@@ -228,7 +231,7 @@ function makeCtx({ sessionController, llm = {}, sessionTitle } = {}) {
     get: (name) => (name === 'workspaceRegistry' ? wsRegistry
       : name === 'sessions' ? fakeSessions
         : name === 'sessionPersistence' ? fakePersistence
-          : name === 'tools' ? fakeTools
+: name === 'tools' ? tools
             : name === 'agentDefaultModel' ? fakeAgentDefaultModel
               : name === 'sessionTitle' ? sessionTitle
                 : undefined),
@@ -385,6 +388,13 @@ try {
   checks['结构化解析(toolCalls/changes/verification)'] = runPersistedInner.toolCalls?.length === 1
     && runPersistedInner.toolCalls[0].name === 'bash'
     && runPersistedInner.changes === 'c1' && runPersistedInner.verification === 'v1' && runPersistedInner.leftovers === 'l1'
+
+  // detail=normal: 截断的 toolCalls, 不注入 toolResults/assistantText 原文
+  const runNormal = await rpc(init.sid, { jsonrpc: '2.0', id: 78, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-persisted', detail: 'normal' } } })
+  const runNormalInner = runNormal.status === 200 ? innerOf(runNormal) : {}
+  checks['detail=normal: 截断 toolCalls/toolResults 不注入原文'] = runNormalInner.detail === 'normal'
+    && Array.isArray(runNormalInner.toolCalls) && runNormalInner.toolCalls[0]?.name === 'bash'
+    && Array.isArray(runNormalInner.toolResults) && runNormalInner.assistantText === undefined
 
   // ── realpath 规范化 ──
   const runNew = await rpc(init.sid, { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: FAKE_CWD } } })
@@ -911,6 +921,16 @@ try {
     acB.abort()
     acC.abort()
     await Promise.allSettled([runA, runB, runC])
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
+  // ── Phase L: 旧宿主 keys() 回退 —— dsh_list_tools 无 schemas() 时退回 keys() ──
+  {
+    const legacyCtx = makeCtx({ llm: fakeLlm, tools: { keys: () => ['bash', 'read'] } })
+    const phaseL = await startPhase(8086, legacyCtx, {})
+    const ltLegacy = innerOf(await phaseL.call('dsh_list_tools', {}))
+    checks['dsh_list_tools: 旧宿主 keys() 回退'] = Array.isArray(ltLegacy) && ltLegacy.some((t) => t.name === 'bash' && t.description === '')
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
   }

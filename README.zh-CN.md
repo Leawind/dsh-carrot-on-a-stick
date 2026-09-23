@@ -260,7 +260,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 ```bash
 npm install
 npm run build    # 独立构建(纯 tsc), 产出 lib/
-npm run smoke    # 端口 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088 假 ctx 冒烟(111 项, 真实 MCP 协议往返) + 端口冲突专项
+npm run smoke    # 端口 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088 假 ctx 冒烟(113 项, 真实 MCP 协议往返) + 端口冲突专项
 ```
 
 真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md) 的方式起一个独立 profile，然后 `E2E_WITH_AGENT=1 node e2e.mjs`。
