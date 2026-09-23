@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0
+
+**自动超时 + 细节打磨**——0.7.0 取消面之上的收尾（Roadmap"无服务端自动超时"就此关闭）：
+
+- **新配置 `taskTimeoutMs`**（默认 `0` = 不启用）：agent turn 执行超过该时长自动走官方
+  `agent.cancel({kind:'hook', reason:'dsh-ops-mcp: task timeout after Xms'})`——与外部取消
+  信号合流到同一条 abort 路径；结果 `error` 注明 `task timed out after Xms (official
+  agent.cancel fired)`，且整个结果带 `isError: true`。长任务部署请按需调大或保持关闭。
+- `session_list` 机会式读取 live 会话对象的 `title`（sessionTitle 服务维护的字段；没有就
+  省略，不报错）——列会话时能直接看到人起的标题。
+- GUI 面板队列统计细分：`X 活跃 / Y 完成 / Z 失败 / W 取消`。
+- 清理：transport 的 `as never` 强转移除（SDK 1.30 的 `handleRequest` 本就收 Node 原生
+  req/res 类型）。
+- E2E 扩充：零 token 相新增 `task_list` / `task_cancel`（未知 taskId 以 isError 拒绝的
+  接线探针）/ `session_list` 三条腿；agent 相新增"`session_list` 包含刚执行的会话（live
+  归并）"；工具清单断言更新到十二个。
+- 冒烟测试 81 → 84 项：超时 error 标注 / hook 原因 / 正常任务不受影响；`session_list`
+  的 live title 断言并入合并检查。
+
 ## 0.7.0
 
 **取消与可观测面**——补上 Roadmap 上最后两个大项：任务可取消、队列/会话可列举。
