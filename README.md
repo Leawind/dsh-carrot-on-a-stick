@@ -226,6 +226,20 @@ are reaped after `sessionTtlMs` (24 h default). Tools also carry spec-metadata (
 sandbox-check them. Note: `queuePersistPath` writes task payloads (task text, caller context,
 results) to a plaintext file — point it at a location with appropriate filesystem permissions.
 
+## Web settings panel
+
+The bundle also injects a settings section into the dsh web UI (**Settings → dsh-ops-mcp**):
+
+- live status badge (listening / soft-stopped / http disabled) and uptime;
+- the MCP endpoint (click to copy) and **start / stop** buttons — soft stop drains and closes
+  cleanly, start re-listens (verified by tests with a real handshake after restart);
+- connected MCP clients: session id, user-agent, connected-at, last activity, request count;
+- model / preset / auth / session-TTL / queue-persistence summary and queue counters
+  (active / done / failed / cancelled).
+
+The panel talks to the host over same-origin routes under `/_dsh/dsh-ops-mcp/*`; mutating routes
+require same-origin markers, so no extra ports or CORS exposure are needed.
+
 ## Provenance
 
 The initial source of this project was **copied from** [`chushixixin/dsh-harness-mcp-server`](https://github.com/chushixixin/dsh-harness-mcp-server) (MIT, thanks @chushixixin) and then evolved as an independent project — no git fork relationship, no upstream contributions planned. Key changes:

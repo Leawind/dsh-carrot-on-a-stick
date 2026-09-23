@@ -223,6 +223,19 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 便于客户端标注与沙箱判断。注意：`queuePersistPath` 会把任务载荷（任务文本、调用方上下文、
 结果）以明文写入指定文件——请放在文件系统权限合适的路径。
 
+## Web 设置面板
+
+bundle 还会向 dsh Web UI 注入一个设置区（**设置 → dsh-ops-mcp**）：
+
+- 实时状态徽章（监听中 / 已软停 / http 关闭）与运行时长；
+- MCP 端点（点击复制）与**停止 / 启动**按钮——软停止会排空并干净关闭，启动重新监听
+  （重启后的真实握手有测试覆盖）；
+- 已连接的 MCP 客户端：会话 id、User-Agent、连接时间、最近活跃、请求数；
+- 模型 / preset / 认证 / 会话 TTL / 队列持久化摘要，以及队列计数（活跃 / 完成 / 失败 / 取消）。
+
+面板经同源路由 `/_dsh/dsh-ops-mcp/*` 与宿主通信；变更类路由要求同源标识，无需额外端口或
+CORS 暴露。
+
 ## 源码来源
 
 本项目的初始源码**复制自** [`chushixixin/dsh-harness-mcp-server`](https://github.com/chushixixin/dsh-harness-mcp-server)（MIT，感谢 @chushixixin），随后作为独立项目演进：不保留 git fork 关系，也不计划向上游贡献。主要改造方向：
