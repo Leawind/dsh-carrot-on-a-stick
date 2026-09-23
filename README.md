@@ -297,7 +297,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085 (130 checks, real MCP protocol round-trips incl. official SDK client)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085 (132 checks, real MCP protocol round-trips incl. official SDK client)
                  # + a port-conflict case (apply must fail loudly)
 ```
 
