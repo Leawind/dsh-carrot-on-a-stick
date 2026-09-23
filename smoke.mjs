@@ -617,6 +617,11 @@ try {
   const runOutsideInner = runOutside.status === 200 ? innerOf(runOutside) : { error: String(runOutside) }
   checks['workspaceRoots: 白名单外目录拒绝'] = String(runOutsideInner.error ?? '').includes('not allowed')
 
+  // 队列侧同样受限, 且在提交时即拒(不入队, 调用方无需轮询才发现)
+  const outsideInbox = await rpcA(sidA, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'x', cwd: outsideDir } } })
+  checks['task_inbox: 越界 cwd 提交时即拒(不入队)'] = parsePayload(outsideInbox.text).result?.isError === true
+    && String(innerOf(outsideInbox).error ?? '').includes('not allowed')
+
   // 卸载 Phase A, 再起模型回退/门禁两个 phase(每个 phase 独立端口 + 独立假 ctx)
   for (const d of disposers.splice(0)) if (typeof d === 'function') d()
   await new Promise((r) => setTimeout(r, 200))
