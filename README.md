@@ -188,7 +188,8 @@ non-browser MCP clients that send no Origin are unaffected), a `/mcp`-only HTTP 
 else 404), `401` answers with a `WWW-Authenticate: Bearer` challenge, and idle transport sessions
 are reaped after `sessionTtlMs` (24 h default). Tools also carry spec-metadata (`title`,
 `annotations.readOnlyHint` etc., the 2025-06-18 protocol fields) so clients can label and
-sandbox-check them.
+sandbox-check them. Note: `queuePersistPath` writes task payloads (task text, caller context,
+results) to a plaintext file — point it at a location with appropriate filesystem permissions.
 
 ## Provenance
 

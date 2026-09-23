@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.2'
+const PLUGIN_VERSION = '0.11.3'
 
 /**
  * 声明依赖的核心服务。
@@ -886,7 +886,8 @@ async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult> {
         }
       }
     } catch (e) {
-      result.assistantText = `[读输出异常] ${String(e)}`
+      // 追加而非覆盖: 读输出中途异常时, 之前已解析出的 assistantText 不丢失
+      result.assistantText = `${result.assistantText}[读输出异常] ${String(e)}`.trim()
     }
     // 超时透出: turn/end 事件里只有 canceled 收场, 这里补上"谁砍的、砍的时候多久"
     if (timedOut) {
@@ -1696,7 +1697,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     sessionTtlMs: nonNeg(config.sessionTtlMs, DEFAULTS.sessionTtlMs),
     authToken: config.authToken ?? DEFAULTS.authToken,
     workspaceRoots: (config.workspaceRoots ?? []).map((r) => resolve(r)),
-    queuePersistPath: config.queuePersistPath ?? DEFAULTS.queuePersistPath,
+    // 持久化路径按 cwd 归一化, 相对路径以进程 cwd 为基准, 语义可预期
+    queuePersistPath: config.queuePersistPath ? resolve(config.queuePersistPath) : DEFAULTS.queuePersistPath,
     defaultDetail: config.defaultDetail ?? DEFAULTS.defaultDetail,
   }
 
