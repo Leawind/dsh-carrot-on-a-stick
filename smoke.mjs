@@ -564,6 +564,14 @@ try {
   const histLim = await rpc(init.sid, { jsonrpc: '2.0', id: 73, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', limit: 2 } } })
   const hlim = histLim.status === 200 ? innerOf(histLim) : { turns: [] }
   checks['session_history: limit 截断且时间正序'] = hlim.turns?.length === 2 && hlim.turns[0].index < hlim.turns[1].index
+
+  // beforeIndex 翻页: 从上次最早 index 之前继续往回取
+  const histPage1 = await rpc(init.sid, { jsonrpc: '2.0', id: 89, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', limit: 2 } } })
+  const page1 = histPage1.status === 200 ? innerOf(histPage1) : { turns: [] }
+  const page2 = await rpc(init.sid, { jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', limit: 2, beforeIndex: page1.turns?.[0]?.index } } })
+  const page2Inner = page2.status === 200 ? innerOf(page2) : { turns: [] }
+  checks['session_history: beforeIndex 向更早翻页'] = Array.isArray(page2Inner.turns) && page2Inner.turns.length > 0
+    && page2Inner.turns.every((t) => t.index < page1.turns[0].index)
   const histPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 74, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-persisted' } } })
   checks['session_history: 持久化-only 会话明确报不可读'] = parsePayload(histPersisted.text).result?.isError === true
     && String(innerOf(histPersisted).error ?? '').includes('not live')
