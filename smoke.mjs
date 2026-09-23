@@ -503,6 +503,19 @@ try {
   const slLim = sessListLim.status === 200 ? innerOf(sessListLim) : { total: 0, sessions: [] }
   checks['session_list: limit 截断且 total 不变'] = slLim.sessions.length === 2 && slLim.total === sl.total
 
+  // ── session_history: live 会话纪要(从最新往回取, 时间正序返回) ──
+  const histLive = await rpc(init.sid, { jsonrpc: '2.0', id: 72, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live' } } })
+  const hl = histLive.status === 200 ? innerOf(histLive) : { turns: [] }
+  checks['session_history: live 会话纪要(assistant+tool_call)'] = Array.isArray(hl.turns) && hl.turns.length >= 3
+    && hl.turns.some((t) => t.role === 'assistant' && String(t.text).includes('done'))
+    && hl.turns.some((t) => t.role === 'tool_call' && t.name === 'bash')
+  const histLim = await rpc(init.sid, { jsonrpc: '2.0', id: 73, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', limit: 2 } } })
+  const hlim = histLim.status === 200 ? innerOf(histLim) : { turns: [] }
+  checks['session_history: limit 截断且时间正序'] = hlim.turns?.length === 2 && hlim.turns[0].index < hlim.turns[1].index
+  const histPersisted = await rpc(init.sid, { jsonrpc: '2.0', id: 74, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-persisted' } } })
+  checks['session_history: 持久化-only 会话明确报不可读'] = parsePayload(histPersisted.text).result?.isError === true
+    && String(innerOf(histPersisted).error ?? '').includes('not live')
+
   // 卸载 Phase B(清空池/队列/server), 再起 Phase A
   for (const d of disposers.splice(0)) {
     if (typeof d === 'function') d()
@@ -715,6 +728,58 @@ try {
     checks['队列持久化: 重启后的任务可取消'] = gCancel.cancelled === true
     await new Promise((r) => setTimeout(r, 200))
     try { unlinkSync(persistPath) } catch { /* 已清理 */ }
+  }
+
+  // ── Phase H: 进度通知 —— agent_run 带 _meta.progressToken 时, SSE 流上应先收到 notifications/progress 心跳 ──
+  {
+    const ctxH = makeCtx({ llm: fakeLlm })
+    const PORT_H = 8091
+    await apply(ctxH, { port: PORT_H, host: '127.0.0.1', progressIntervalMs: 300 })
+    await new Promise((r) => setTimeout(r, 200))
+    const baseH = `http://127.0.0.1:${PORT_H}/mcp`
+    const postH = async (sessionId, body) => {
+      const res = await fetch(baseH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}) },
+        body: JSON.stringify(body),
+      })
+      return { sid: res.headers.get('mcp-session-id') ?? sessionId, res }
+    }
+    const initH = await postH(undefined, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-progress', version: '1.0' } } })
+    await initH.res.text()
+    const sidH = initH.sid
+    await postH(sidH, { jsonrpc: '2.0', method: 'notifications/initialized' })
+
+    // 长任务 + progressToken: for-await 增量读 SSE 流, 收集响应前到达的心跳
+    const ac = new AbortController()
+    const runId = 200
+    const res = await fetch(baseH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'Mcp-Session-Id': sidH },
+      body: JSON.stringify({ jsonrpc: '2.0', id: runId, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'long job', sessionId: 'sess-slow' }, _meta: { progressToken: 'tok-progress' } } }),
+      signal: ac.signal,
+    })
+    let buf = ''
+    const decoderH = new TextDecoder()
+    const deadline = Date.now() + 1500
+    try {
+      for await (const chunk of res.body) {
+        buf += decoderH.decode(chunk, { stream: true })
+        if (Date.now() > deadline) break
+      }
+    } catch { /* 下方 abort 导致的流中断 */ }
+    await postH(sidH, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: runId } })
+    ac.abort()
+    const msgs = buf.split('\n')
+      .filter((l) => l.startsWith('data: '))
+      .map((l) => { try { return JSON.parse(l.slice(6)) } catch { return null } })
+      .filter(Boolean)
+    const progresses = msgs.filter((m) => m.method === 'notifications/progress' && m.params?.progressToken === 'tok-progress')
+    checks['进度通知: turn 期间在 SSE 流上收到 progress 心跳'] = progresses.length >= 2
+    checks['进度通知: progress 单调递增且带 message'] = progresses.every((p, i) => i === 0 || p.params.progress > progresses[i - 1].params.progress)
+      && progresses.every((p) => typeof p.params.message === 'string' && p.params.message.includes('session events'))
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
   }
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)

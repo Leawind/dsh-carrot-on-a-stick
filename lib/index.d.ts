@@ -6,12 +6,14 @@
  *   - dsh_list_tools   : 列出 dsh 工具注册表(name + description)
  *   - model_list       : 列出当前可路由的 provider/模型/推理档(选模型前先查这里)
  *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果;
- *                        客户端 notifications/cancelled 取消 → 官方 agent.cancel({kind:'user'})
+ *                        客户端 notifications/cancelled 取消 → 官方 agent.cancel({kind:'user'});
+ *                        调用方 _meta.progressToken → notifications/progress 心跳(新增会话事件数)
  *   - task_inbox       : 调用方 push 结构化任务(任务+上下文)到 dsh 队列, 异步执行, 返回 taskId
  *   - task_result      : 取回任务的结构化结果(changes/verification/leftovers)
  *   - task_list        : 列出队列中的任务(taskId/状态/cwd; 队列可观测)
  *   - task_cancel      : 取消排队/执行中的任务(执行中走官方 agent.cancel)
  *   - session_list     : 列出已知会话元数据(live+持久化合并, 只读)
+ *   - session_history  : 读 live 会话的对话纪要(从最新往回取, 文本截断, 只读)
  *   - select_model     : 切换已存在会话使用的模型(官方 selectModel 路径)
  *   - attach_session   : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session   : 给已有会话改名
@@ -68,6 +70,11 @@ export interface Config {
      * 长任务(大改动/长分析)部署请按需调大或保持关闭。
      */
     taskTimeoutMs?: number;
+    /**
+     * 进度心跳间隔毫秒数(默认 5000, 最小 250)。仅在调用方于 _meta.progressToken 里请求进度时
+     * 生效: agent turn 期间按该间隔发 notifications/progress(内容为新增会话事件数)。
+     */
+    progressIntervalMs?: number;
     /** 已完成任务保留毫秒数(默认 10 分钟) */
     taskTtlMs?: number;
     /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
