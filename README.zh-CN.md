@@ -186,7 +186,8 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 的非浏览器 MCP 客户端不受影响）；HTTP 入口只服务 `/mcp`，其余路径 404；401 响应带
 `WWW-Authenticate: Bearer` 挑战；空闲传输会话超过 `sessionTtlMs`（默认 24 小时）自动回收。
 工具同时携带协议元数据（`title`、`annotations.readOnlyHint` 等，2025-06-18 协议字段），
-便于客户端标注与沙箱判断。
+便于客户端标注与沙箱判断。注意：`queuePersistPath` 会把任务载荷（任务文本、调用方上下文、
+结果）以明文写入指定文件——请放在文件系统权限合适的路径。
 
 ## 源码来源
 
