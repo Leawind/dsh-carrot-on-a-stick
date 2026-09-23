@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.10.0'
+const PLUGIN_VERSION = '0.11.0'
 
 /**
  * 声明依赖的核心服务。
@@ -402,6 +402,17 @@ function selectionOfAgent(agent: unknown): ModelSelection {
   const model = s(opts?.model)
   const reasoningEffort = s(opts?.reasoningEffort)
   return reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+}
+
+/** 已知会话的当前模型选择: 常驻池记录 → live agent options; 持久化-only 会话无从得知(agent 未重建), 返回 undefined */
+function knownSelectionOf(ctx: Context, sessionId: string): ModelSelection | undefined {
+  const poolKeyOfSession = sessionToPoolKey.get(sessionId)
+  const pooled = poolKeyOfSession !== undefined ? liveAgents.get(poolKeyOfSession) : undefined
+  if (pooled) return pooled.selection
+  const live = ctx.agents.get(asSessionId(sessionId))
+  if (!live) return undefined
+  const sel = selectionOfAgent(live)
+  return sel.provider && sel.model ? sel : undefined
 }
 
 /**
@@ -1386,7 +1397,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     'session_list',
     {
       title: 'List sessions',
-      description: '列出已知会话的元数据(sessionId/创建时间/cwd/preset)。live 与持久化合并、live 优先、按创建时间倒序; 用于挑选要续接(agent_run 的 sessionId)/改名/归组的会话。',
+      description: '列出已知会话的元数据(sessionId/创建时间/cwd/preset/当前模型)。live 与持久化合并、live 优先、按创建时间倒序; 模型选择仅 live/常驻池会话可知。用于挑选要续接(agent_run 的 sessionId)/改名/归组的会话。',
       inputSchema: {
         limit: z.number().int().min(1).max(100).optional().describe('最多返回条数(默认 20)'),
       },
@@ -1410,13 +1421,17 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       const items = [...headers.values()]
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, limit ?? 20)
-        .map((h) => ({
-          sessionId: h.id,
-          createdAt: h.createdAt,
-          ...(liveTitles.get(h.id) ? { title: liveTitles.get(h.id) } : {}),
-          ...(h.cwd ? { cwd: h.cwd } : {}),
-          ...(h.agentPreset ? { agentPreset: h.agentPreset } : {}),
-        }))
+        .map((h) => {
+          const model = knownSelectionOf(ctx, h.id)
+          return {
+            sessionId: h.id,
+            createdAt: h.createdAt,
+            ...(liveTitles.get(h.id) ? { title: liveTitles.get(h.id) } : {}),
+            ...(h.cwd ? { cwd: h.cwd } : {}),
+            ...(h.agentPreset ? { agentPreset: h.agentPreset } : {}),
+            ...(model ? { model: projectModel(model) } : {}),
+          }
+        })
       return out(JSON.stringify({ total: headers.size, sessions: items }))
     },
   )

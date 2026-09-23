@@ -114,7 +114,7 @@ const errAgent = (() => {
 
 const fakeSessions = {
   get: (id) => (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : id === 'sess-err' ? errAgent.session : undefined),
-  list: () => [liveSession2],
+  list: () => [liveSession2, liveAgent.session],
   flush: async (session) => { flushed.push(session.id); return true },
 }
 // 0.1.5+ 的 SessionPersistenceSnapshot(header 在 .header) + 一条旧版裸 header 形状
@@ -499,6 +499,9 @@ try {
     && sl.sessions.some((s) => s.sessionId === 'sess-persisted')
     && sl.sessions.some((s) => s.sessionId === 'sess-legacy')
     && sl.sessions.find((s) => s.sessionId === 'sess-live2')?.title === 'Live Two'
+  checks['session_list: 回报已知会话的当前模型'] = sl.sessions.some((s) => s.sessionId === 'sess-live'
+    && s.model?.provider === 'live-p' && s.model?.model === 'live-m')
+    && !sl.sessions.some((s) => s.sessionId === 'sess-persisted' && s.model)
   const sessListLim = await rpc(init.sid, { jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'session_list', arguments: { limit: 2 } } })
   const slLim = sessListLim.status === 200 ? innerOf(sessListLim) : { total: 0, sessions: [] }
   checks['session_list: limit 截断且 total 不变'] = slLim.sessions.length === 2 && slLim.total === sl.total

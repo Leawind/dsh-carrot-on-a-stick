@@ -15,7 +15,7 @@ dsh ships a complete agent runtime — model routing, tool sandbox, presets, per
 
 ```
 MCP client (Claude Code / Codex / another dsh / …)
-   │  agent_run / task_inbox / task_result / model_list / select_model (HTTP + Bearer)
+   │  agent_run / task_* / session_* / model_list / select_model (HTTP + Bearer)
    ▼
 dsh-ops-mcp (MCP server, 127.0.0.1:8090)
    │  ctx.agents.create → mount preset
