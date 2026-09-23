@@ -75,6 +75,41 @@ Every result is structured: `sessionId / model / assistantText / toolCalls / too
 
 Sessions are reused per `cwd + model` (LRU, default 8) to avoid reloading project context on every call.
 
+## Typical workflows
+
+**1. One-off task, synchronous** — get a structured summary back:
+
+```json
+{ "name": "agent_run", "arguments": { "task": "fix the failing test in src/auth", "cwd": "/workspace/app" } }
+```
+
+Continue it later with `"sessionId": "<from the result>"` — send only the delta in `context`.
+
+**2. Fire-and-forget queue** — submit, poll cheaply, cancel if needed:
+
+```json
+{ "name": "task_inbox", "arguments": { "task": "…", "cwd": "/workspace/app", "provider": "deepseek-official", "model": "…" } }
+→ { "taskId": "…" }
+{ "name": "task_result", "arguments": { "taskId": "…", "detail": "status" } }   // poll: no payload re-injection
+{ "name": "task_cancel", "arguments": { "taskId": "…" } }                        // optional
+{ "name": "task_result", "arguments": { "taskId": "…" } }                        // fetch the summary once done
+```
+
+`task_list` shows everything queued/running/finished at a glance.
+
+**3. Discover and steer sessions** — find the right session, check its model, read what happened:
+
+```json
+{ "name": "session_list", "arguments": { "limit": 10 } }                // sessionId / title / cwd / model
+{ "name": "session_history", "arguments": { "sessionId": "…" } }        // recent turns, truncated
+{ "name": "select_model", "arguments": { "sessionId": "…", "provider": "…", "model": "…" } }
+```
+
+**4. Long synchronous runs** — `agent_run` supports MCP-native progress and cancellation: clients
+that pass `_meta.progressToken` receive `notifications/progress` heartbeats, and any client can
+cancel via the standard `notifications/cancelled` (both wired to the host agent's official
+`cancel`). No custom polling protocol required.
+
 ## Install & run
 
 The plugin must be installed into a dsh **profile directory** (the loader resolves plugin names from there; `--patch` alone from a repo checkout will not find the local package — see finding 1 in the [E2E report](./docs/e2e-0.1.5-rc.2.zh.md)):

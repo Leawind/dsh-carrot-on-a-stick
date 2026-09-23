@@ -75,6 +75,40 @@ dsh agent —— 完整工具集：bash、fs、todo、web…
 
 会话按 `cwd + 模型` 复用（LRU，默认 8 个），避免每次调用都重新加载项目上下文。
 
+## 典型工作流
+
+**1. 一次性任务（同步）**——直接拿结构化总结：
+
+```json
+{ "name": "agent_run", "arguments": { "task": "修复 src/auth 里挂掉的测试", "cwd": "/workspace/app" } }
+```
+
+之后用 `"sessionId": "<结果里的 id>"` 续接同一会话——`context` 只发增量。
+
+**2. 异步队列**——提交、轻量轮询、按需取消：
+
+```json
+{ "name": "task_inbox", "arguments": { "task": "…", "cwd": "/workspace/app", "provider": "deepseek-official", "model": "…" } }
+→ { "taskId": "…" }
+{ "name": "task_result", "arguments": { "taskId": "…", "detail": "status" } }   // 轮询: 不重复注入 payload
+{ "name": "task_cancel", "arguments": { "taskId": "…" } }                        // 可选
+{ "name": "task_result", "arguments": { "taskId": "…" } }                        // 完成后取一次总结
+```
+
+`task_list` 一览全部排队/执行中/已结束的任务。
+
+**3. 发现并驾驭会话**——找到对的会话、确认它的模型、回看发生了什么：
+
+```json
+{ "name": "session_list", "arguments": { "limit": 10 } }                // sessionId / 标题 / cwd / 模型
+{ "name": "session_history", "arguments": { "sessionId": "…" } }        // 最近轮次（截断）
+{ "name": "select_model", "arguments": { "sessionId": "…", "provider": "…", "model": "…" } }
+```
+
+**4. 长时同步任务**——`agent_run` 原生支持 MCP 进度与取消：客户端传 `_meta.progressToken`
+即收到 `notifications/progress` 心跳，任意客户端都可用标准 `notifications/cancelled` 取消
+（两者都接到宿主 agent 的官方 `cancel`），无需自定义轮询协议。
+
 ## 安装与运行
 
 插件以包形式装进 dsh 的 **profile 目录**（loader 从那里解析插件名；在仓库根直接 `--patch` 是找不到本地包的——见 [E2E 记录](./docs/e2e-0.1.5-rc.2.zh.md) 发现 1）：
