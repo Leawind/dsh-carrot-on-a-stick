@@ -483,6 +483,12 @@ try {
   const inboxModelResult = await rpc(init.sid, { jsonrpc: '2.0', id: 39, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: inboxModelId } } })
   checks['task_inbox 的模型覆盖生效(结果自报模型)'] = innerOf(inboxModelResult).model?.model === 'm9'
 
+  // task_list 完成任务回报实际执行的 sessionId(重启/轮询后仍可续接)
+  const tlDone = await rpc(init.sid, { jsonrpc: '2.0', id: 87, method: 'tools/call', params: { name: 'task_list', arguments: { status: 'done' } } })
+  const tlDoneArr = tlDone.status === 200 ? innerOf(tlDone) : []
+  const doneItem = Array.isArray(tlDoneArr) ? tlDoneArr.find((t) => t.taskId === queuedId) : undefined
+  checks['task_list: 完成任务回报 sessionId(可续接)'] = Boolean(doneItem?.sessionId)
+
   // ── 取消链路: agent_run 经 MCP notifications/cancelled → 官方 agent.cancel({kind:'user'}) ──
   // 注意: 规范要求服务端对已取消请求 SHOULD NOT 回响应, 所以这里不 await 响应体,
   // 断言服务端效果(cancel 被调用一次), 最后主动断开连接。
@@ -859,6 +865,8 @@ try {
     checks['进度通知: turn 期间在 SSE 流上收到 progress 心跳'] = progresses.length >= 2
     checks['进度通知: progress 单调递增且带 message'] = progresses.every((p, i) => i === 0 || p.params.progress > progresses[i - 1].params.progress)
       && progresses.every((p) => typeof p.params.message === 'string' && p.params.message.includes('session events'))
+    checks['进度通知: 首个通知即回报已启动(progress=1, 0 事件)'] = progresses[0]?.params?.progress === 1
+      && String(progresses[0]?.params?.message ?? '').includes('0 new session events')
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
   }

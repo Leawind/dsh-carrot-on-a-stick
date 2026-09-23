@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.5'
+const PLUGIN_VERSION = '0.11.6'
 
 /**
  * 声明依赖的核心服务。
@@ -803,7 +803,8 @@ async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult> {
     const baseline = eventsOf(handle.agent.session).length
     // 标记活跃: 池 LRU 淘汰据此跳过本会话(不能 dispose 一个正在跑 turn 的会话)
     activeTurnSessions.add(String(sessionId))
-    if (process.env.DEBUG_PROGRESS) console.error('[dbg mark] +', String(sessionId).slice(0, 8), 'set size=', activeTurnSessions.size)
+    // 立即回报一次"已启动"(events=0), 让调用方的进度 UI 无需等第一个心跳间隔
+    if (reportProgress) void Promise.resolve(reportProgress(0)).catch(() => { /* 单次心跳失败不影响任务 */ })
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
     const fullTask = [
@@ -1409,6 +1410,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         .map((t) => ({
           taskId: t.id,
           status: t.status,
+          ...(t.sessionId ? { sessionId: t.sessionId } : {}),
           createdAt: t.createdAt,
           ...(t.finishedAt ? { finishedAt: t.finishedAt } : {}),
           cwd: t.cwd,
@@ -1741,6 +1743,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           onStart: () => { item.status = 'running'; persistQueue() },
         })
         item.result.taskId = item.id
+        // 回填实际执行的会话(新建池会话时请求参数里没有), task_list/重启后续接都靠它
+        if (!item.sessionId && item.result.sessionId) item.sessionId = item.result.sessionId
         item.status = item.controller?.signal.aborted ? 'cancelled' : 'done'
       } catch (e) {
         item.error = String(e)
