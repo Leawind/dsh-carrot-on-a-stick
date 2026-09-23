@@ -130,6 +130,8 @@ sequenceDiagram
 
 ## 安装与运行
 
+要求 dsh 宿主运行在 **Node.js >= 18**（插件的 `engines` 字段已声明）。
+
 插件以包形式装进 dsh 的 **profile 目录**（loader 从那里解析插件名；在仓库根直接 `--patch` 是找不到本地包的——见 [E2E 记录](./docs/e2e-0.1.5-rc.2.zh.md) 发现 1）：
 
 ```bash
