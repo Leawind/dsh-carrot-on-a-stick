@@ -17,7 +17,7 @@
 //  10. 取消与可观测: agent_run 经 notifications/cancelled 取消(官方 agent.cancel)、
 //      task_cancel/task_list 队列观测、session_list/session_history 查询面
 //  11. LRU 淘汰跳过活跃会话、并发压力、GUI 控制面路由(status/stop/start 同源门禁)
-import { existsSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
 
@@ -297,6 +297,15 @@ function innerOf(resp) {
 }
 
 const checks = {}
+/** 轮询等待条件成立(默认 5s 超时); 时序敏感断言统一走它, 不依赖固定 sleep */
+async function waitFor(fn, timeoutMs = 5000, step = 100) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (fn()) return true
+    if (Date.now() > deadline) return false
+    await new Promise((r) => setTimeout(r, step))
+  }
+}
 try {
   // ── Phase B(主流程): 无认证、无白名单, 端口 8099; 存量捞回显式开启 ──
   await apply(ctx, { port: PORT, host: '127.0.0.1', reattachOrphans: true })
@@ -824,7 +833,16 @@ try {
     const gA = innerOf(await phaseG.call('task_inbox', { task: 'slow A', cwd: slowCwd }))
     const gB = innerOf(await phaseG.call('task_inbox', { task: 'slow B', cwd: slowCwd }))
     const gC = innerOf(await phaseG.call('task_inbox', { task: 'quick', cwd: FAKE_CWD }))
-    await new Promise((r) => setTimeout(r, 400)) // A running(慢), B queued(锁内), C done → 全部落盘
+    // 等持久化快照达到目标状态(A running / B queued / C done)——轮询而非固定 sleep
+    await waitFor(() => {
+      try {
+        const items = JSON.parse(readFileSync(persistPath, 'utf8'))
+        const byId = new Map(items.map((i) => [i.id, i]))
+        return byId.get(gA.taskId)?.status === 'running'
+          && byId.get(gB.taskId)?.status === 'queued'
+          && byId.get(gC.taskId)?.status === 'done'
+      } catch { return false }
+    })
     // 重启: 卸载(关 server + 清内存队列) → 同配置重新 apply(恢复快照)
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 300))
