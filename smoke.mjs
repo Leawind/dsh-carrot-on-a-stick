@@ -857,6 +857,64 @@ try {
     await new Promise((r) => setTimeout(r, 150))
   }
 
+  // ── Phase K: LRU 淘汰跳过活跃会话 —— maxAgents:1 时, 忙会话不被淘汰 dispose, 空闲会话才被逐出 ──
+  {
+    const ctxK = makeCtx({ llm: fakeLlm })
+    const PORT_K = 8087
+    await apply(ctxK, { port: PORT_K, host: '127.0.0.1', maxAgents: 1 })
+    await new Promise((r) => setTimeout(r, 200))
+    const baseK = `http://127.0.0.1:${PORT_K}/mcp`
+    const postK = async (sessionId, body) => {
+      const res = await fetch(baseK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}) },
+        body: JSON.stringify(body),
+      })
+      return { sid: res.headers.get('mcp-session-id') ?? sessionId, res }
+    }
+    const initK = await postK(undefined, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-lru', version: '1.0' } } })
+    await initK.res.text()
+    const sidK = initK.sid
+    await postK(sidK, { jsonrpc: '2.0', method: 'notifications/initialized' })
+
+    const cwdA = resolve(FAKE_CWD, 'slow-cwd-evict-A')
+    const cwdB = resolve(FAKE_CWD, 'slow-cwd-evict-B')
+    const acA = new AbortController()
+    const acB = new AbortController()
+    const acC = new AbortController()
+    const callNoWait = (id, name, args, ac) => {
+      const p = fetch(baseK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'Mcp-Session-Id': sidK },
+        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }),
+        signal: ac.signal,
+      }).then((r) => r.text()).catch(() => 'aborted')
+      return p
+    }
+
+    const runA = callNoWait(80, 'agent_run', { task: 'hold A', cwd: cwdA }, acA)
+    await new Promise((r) => setTimeout(r, 250)) // A 进入活跃标记
+    const runB = callNoWait(81, 'agent_run', { task: 'hold B', cwd: cwdB }, acB) // 触发淘汰: A 忙 → 跳过, 池超限建 B
+    await new Promise((r) => setTimeout(r, 250))
+    const idA = created.find((c) => c.cwd === cwdA)?.id
+    const idB = created.find((c) => c.cwd === cwdB)?.id
+    console.error('[dbg K] idA=', idA, 'idB=', idB, 'disposed=', JSON.stringify(disposed))
+    checks['LRU: 满池时跳过活跃会话(新建不 dispose A)'] = Boolean(idA && idB) && !disposed.includes(idA)
+
+    // 取消 A → 收敛; C 到来时 A 空闲 → 被 LRU 正常淘汰 dispose
+    await postK(sidK, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 80 } })
+    await new Promise((r) => setTimeout(r, 300))
+    const runC = callNoWait(82, 'agent_run', { task: 'quick C', cwd: resolve(FAKE_CWD, 'evict-C') }, acC)
+    await new Promise((r) => setTimeout(r, 400))
+    checks['LRU: 空闲会话被正常淘汰 dispose'] = disposed.includes(idA)
+    acA.abort()
+    acB.abort()
+    acC.abort()
+    await Promise.allSettled([runA, runB, runC])
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
   // ── Phase J: GUI 控制面路由 —— status 快照 / stop-start 同源门禁 / 软停启循环 ──
   {
     const { EventEmitter } = await import('node:events')

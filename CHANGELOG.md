@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.5
+
+**修复：池 LRU 淘汰不再打断活跃会话**——此前 `maxAgents` 压力下，不同 cwd 的新任务会淘汰
+（dispose）一个正在执行 turn 的会话，直接砍掉别人的运行中任务。现在：
+
+- executeTask 执行期间把会话 id 记入 `activeTurnSessions`；
+- LRU 淘汰跳过活跃会话（优先逐出空闲的），全部忙碌时允许池暂时超限；
+- 冒烟测试 109 → 111 项：`maxAgents:1` 下忙会话不被 dispose、空闲会话正常被逐出。
+
 ## 0.11.4
 
 **加固**：MCP POST 请求体上限 10MB——`content-length` 声明超限的请求**先排空请求体再回
