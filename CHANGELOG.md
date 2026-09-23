@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+**取消与可观测面**——补上 Roadmap 上最后两个大项：任务可取消、队列/会话可列举。
+
+- **`agent_run` 支持 MCP 级取消**：客户端发 `notifications/cancelled`（MCP 规范的请求取消）→
+  SDK abort 信号 → 插件调宿主官方 `agent.cancel({kind:'user'})`（中止当前 turn 并清掉未开工的
+  排队输入），随后等 agent 收敛——withLock 的锁持有到收敛为止，取消不会与后续 followup 并发。
+  按规范，服务端对已取消请求 SHOULD NOT 回响应；取消本身的结果经 turn/end 事件照常进
+  `result.error`（下次续接可见）。宿主缺 `cancel`（旧版本）时退化为不可取消、不报错。
+- **新工具 `task_cancel`**：取消排队中的任务（直接出队，不再投递给 agent——`executeTask`
+  拿到锁后对已中止信号直接以取消收场）或执行中的任务（同上走官方 cancel）。已结束任务
+  原样回报当前状态。
+- **新工具 `task_list`**：列出队列任务（taskId/状态/创建时间/cwd/error），可按状态过滤；
+  入口顺带做一次 TTL 清理。任务状态新增 `cancelled`（TTL 清理与 GUI 统计同步跟上）。
+- **新工具 `session_list`**（只读）：live + 持久化合并（live 优先、快照/裸 header 两种形状
+  兼容）、按创建时间倒序，列出 sessionId/createdAt/cwd/agentPreset——挑选要续接/改名/归组
+  的会话不再靠猜。
+- 冒烟测试 72 → 81 项：`notifications/cancelled` → `agent.cancel({kind:'user'})` 恰一次、
+  排队取消直接出队、执行中取消收敛为 `cancelled`、取消结果失败透出（error 含 canceled）、
+  `task_list` 状态快照、`session_list` 合并与 limit。
+
 ## 0.6.0
 
 **MCP 协议一致性收紧**——对照 MCP 规范逐项审查后的修复与补齐（审查结论：核心生命周期/传输层

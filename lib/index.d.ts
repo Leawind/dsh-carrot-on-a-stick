@@ -5,9 +5,13 @@
  *   - echo             : 验证 MCP server 连通
  *   - dsh_list_tools   : 列出 dsh 工具注册表(name + description)
  *   - model_list       : 列出当前可路由的 provider/模型/推理档(选模型前先查这里)
- *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
+ *   - agent_run        : 同步执行任务(改代码/分析/跑命令), 返回结构化结果;
+ *                        客户端 notifications/cancelled 取消 → 官方 agent.cancel({kind:'user'})
  *   - task_inbox       : 调用方 push 结构化任务(任务+上下文)到 dsh 队列, 异步执行, 返回 taskId
  *   - task_result      : 取回任务的结构化结果(changes/verification/leftovers)
+ *   - task_list        : 列出队列中的任务(taskId/状态/cwd; 队列可观测)
+ *   - task_cancel      : 取消排队/执行中的任务(执行中走官方 agent.cancel)
+ *   - session_list     : 列出已知会话元数据(live+持久化合并, 只读)
  *   - select_model     : 切换已存在会话使用的模型(官方 selectModel 路径)
  *   - attach_session   : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session   : 给已有会话改名

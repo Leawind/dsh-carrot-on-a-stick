@@ -30,9 +30,12 @@ dsh agent — full toolset: bash, fs, todo, web…
 | `echo` | connectivity check |
 | `dsh_list_tools` | list the host-global tool registry (name + description; model tools are preset-scoped, usually empty) |
 | `model_list` | list currently routable providers, model ids, reasoning efforts, and the default selection (look here before picking a model) |
-| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size |
+| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size; cancellable via the MCP `notifications/cancelled` (the host agent's official `cancel` is invoked) |
 | `task_inbox` | push a structured task (task + context + cwd + model) into the async queue, returns `taskId` |
 | `task_result` | fetch a queued task's result; `detail=status` is a lightweight poll that never re-injects the payload |
+| `task_list` | list queued/running/finished tasks (queue observability) |
+| `task_cancel` | cancel a queued or running task (a running one is cancelled through the host's official `agent.cancel`) |
+| `session_list` | list known sessions (live + persisted, newest first) to pick `sessionId`s for continuation |
 | `select_model` | switch the model of an **existing session** (official `sessionController.selectModel` path) |
 | `attach_session` | attach a session to the workspace of its cwd |
 | `rename_session` | rename an existing session |
@@ -196,12 +199,14 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
 **0.6.0 tightened MCP-spec conformance**: tool errors now carry `isError: true`, an Origin-header check joins the DNS-rebinding guards, `401` includes a `WWW-Authenticate` challenge, tools expose `title` + `annotations`, idle transport sessions are reaped (`sessionTtlMs`), and the GUI panel shows the TTL.
+**0.7.0 completed the cancellation & observability surface**: `agent_run` honours the MCP `notifications/cancelled` (wired to the host's official `agent.cancel({kind:'user'})`), and new `task_cancel` / `task_list` / `session_list` tools make the queue listable+cancellable and sessions discoverable — both previously open roadmap items.
 
 What remains:
 
 - [ ] The task queue lives in process memory; a restart loses it (persistence is future work).
-- [ ] No server-side timeout or cancellation for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it; callers should bring their own MCP-level timeout. The queue cannot be listed or cancelled either.
-- [ ] Read-only query surface is still incomplete: no `session_list` (list sessions, read history, read a session's current model) — only `attach_session` / `rename_session` / `select_model`.
+- [ ] No server-side timeout for `agent_run` / `task_inbox` — a hung agent holds its cwd's serial lock and later same-directory tasks queue behind it (callers can cancel: MCP-level `notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks — but nothing fires automatically).
+- [x] ~~The queue cannot be listed or cancelled either~~ — done in 0.7.0 (`task_list` / `task_cancel`).
+- [x] ~~Read-only query surface is still incomplete~~ — `session_list` (0.7.0) joins `attach_session` / `rename_session` / `select_model`; reading a session's full history is still future work.
 - [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
 - [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
 - [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
@@ -213,7 +218,7 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094 (72 checks, real MCP protocol round-trips)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094 (81 checks, real MCP protocol round-trips)
                  # + a port-conflict case (apply must fail loudly)
 ```
 

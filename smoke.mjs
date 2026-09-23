@@ -69,6 +69,36 @@ function makeAgent(id, cwd, options) {
 const liveAgent = makeAgent('sess-live', FAKE_CWD, { provider: 'live-p', model: 'live-m' })
 const liveSession2 = { id: 'sess-live2', header: { version: 0, id: 'sess-live2', createdAt: 1, cwd: FAKE_CWD } }
 
+// 慢 agent: whenIdle 挂起直到 cancel(模拟宿主 cancel 中止 turn 后收敛), 验证取消链路
+const slowCancelCalls = []
+const slowAgents = []
+function makeSlowAgent(id, cwd, options) {
+  const events = []
+  let resolveIdle
+  const agent = {
+    options,
+    cancelCalls: [],
+    cancel: (cause) => {
+      agent.cancelCalls.push(cause)
+      slowCancelCalls.push({ id, cause })
+      events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'canceled', reason: cause?.kind ?? 'user' } } })
+      const r = resolveIdle
+      resolveIdle = undefined
+      r?.()
+    },
+    session: {
+      id,
+      header: { version: 0, id, createdAt: Date.now(), cwd },
+      snapshotEvents: (from = 0) => events.slice(from),
+    },
+    followup: (message) => { events.push({ type: 'user/message', data: { message } }) },
+    whenIdle: () => new Promise((r) => { resolveIdle = r }),
+  }
+  slowAgents.push(agent)
+  return agent
+}
+const slowLiveAgent = makeSlowAgent('sess-slow', FAKE_CWD, { provider: 'live-p', model: 'live-m' })
+
 // 失败路径: 只产出 turn/end{reason: error} 的 live 会话(模型调用失败的样子)
 const errAgent = (() => {
   const events = []
@@ -145,11 +175,14 @@ function makeCtx({ sessionController, llm = {} } = {}) {
     llm,
     sessionController,
     agents: {
-      get: (id) => (id === 'sess-live' ? liveAgent : id === 'sess-err' ? errAgent : undefined),
+      get: (id) => (id === 'sess-live' ? liveAgent : id === 'sess-err' ? errAgent : id === 'sess-slow' ? slowLiveAgent : undefined),
       create: async ({ sessionId, meta, agentOptions, setup }) => {
         const id = String(sessionId)
         created.push({ id, cwd: meta?.cwd, agentOptions })
-        const agent = makeAgent(id, meta?.cwd, agentOptions)
+        // cwd 含 slow-cwd: 建慢 agent(whenIdle 挂起, 仅 cancel 收敛), 供取消链路测试
+        const agent = String(meta?.cwd ?? '').includes('slow-cwd')
+          ? makeSlowAgent(id, meta?.cwd, agentOptions)
+          : makeAgent(id, meta?.cwd, agentOptions)
         if (setup) await setup({}, agent)
         return { agent, dispose: async () => { disposed.push(id) } }
       },
@@ -411,6 +444,63 @@ try {
   await new Promise((r) => setTimeout(r, 300))
   const inboxModelResult = await rpc(init.sid, { jsonrpc: '2.0', id: 39, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: inboxModelId } } })
   checks['task_inbox 的模型覆盖生效(结果自报模型)'] = innerOf(inboxModelResult).model?.model === 'm9'
+
+  // ── 取消链路: agent_run 经 MCP notifications/cancelled → 官方 agent.cancel({kind:'user'}) ──
+  // 注意: 规范要求服务端对已取消请求 SHOULD NOT 回响应, 所以这里不 await 响应体,
+  // 断言服务端效果(cancel 被调用一次), 最后主动断开连接。
+  {
+    const ac = new AbortController()
+    const slowRunId = 60
+    const slowRunFetch = fetch(BASE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'Mcp-Session-Id': init.sid },
+      body: JSON.stringify({ jsonrpc: '2.0', id: slowRunId, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'long job', sessionId: 'sess-slow' } } }),
+      signal: ac.signal,
+    }).then((res) => res.text()).catch(() => 'aborted')
+    await new Promise((r) => setTimeout(r, 200)) // 让请求进入 whenIdle 挂起
+    await rpc(init.sid, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: slowRunId } })
+    await new Promise((r) => setTimeout(r, 300)) // 让 cancel 链路收敛
+    checks['agent_run 可取消(cancelled 通知 → 官方 agent.cancel 一次)'] = slowLiveAgent.cancelCalls.length === 1
+      && slowLiveAgent.cancelCalls[0]?.kind === 'user'
+    ac.abort() // 服务端不会回响应(规范 SHOULD NOT); 主动断开, 避免 fetch 悬挂
+    await slowRunFetch
+  }
+
+  // ── task_cancel / task_list: 排队(锁内)与执行中两条取消路 ──
+  const slowCwd = resolve(FAKE_CWD, 'slow-cwd')
+  const inboxA = await rpc(init.sid, { jsonrpc: '2.0', id: 62, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'slow A', cwd: slowCwd } } })
+  const idA = innerOf(inboxA).taskId
+  const inboxB = await rpc(init.sid, { jsonrpc: '2.0', id: 63, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'slow B', cwd: slowCwd } } })
+  const idB = innerOf(inboxB).taskId
+  await new Promise((r) => setTimeout(r, 200)) // A 持锁执行中, B 排队中
+  const cancelB = await rpc(init.sid, { jsonrpc: '2.0', id: 64, method: 'tools/call', params: { name: 'task_cancel', arguments: { taskId: idB } } })
+  checks['task_cancel: 排队中任务直接取消'] = innerOf(cancelB).cancelled === true
+  const taskList1 = await rpc(init.sid, { jsonrpc: '2.0', id: 65, method: 'tools/call', params: { name: 'task_list', arguments: {} } })
+  const listArr = taskList1.status === 200 ? innerOf(taskList1) : []
+  checks['task_list: 状态快照(A running / B cancelled)'] = Array.isArray(listArr)
+    && listArr.find((t) => t.taskId === idA)?.status === 'running'
+    && listArr.find((t) => t.taskId === idB)?.status === 'cancelled'
+  const cancelA = await rpc(init.sid, { jsonrpc: '2.0', id: 66, method: 'tools/call', params: { name: 'task_cancel', arguments: { taskId: idA } } })
+  checks['task_cancel: 执行中任务接受取消'] = innerOf(cancelA).cancelled === true
+  await new Promise((r) => setTimeout(r, 300)) // 等 runner 经官方 cancel 收敛
+  const resA = await rpc(init.sid, { jsonrpc: '2.0', id: 67, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: idA, detail: 'status' } } })
+  const resB = await rpc(init.sid, { jsonrpc: '2.0', id: 68, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: idB, detail: 'status' } } })
+  checks['task_result: 两个取消任务均为 cancelled'] = innerOf(resA).status === 'cancelled' && innerOf(resB).status === 'cancelled'
+  const resAFull = await rpc(init.sid, { jsonrpc: '2.0', id: 71, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: idA } } })
+  checks['取消结果失败透出(error 含 canceled)'] = String(innerOf(resAFull).error ?? '').includes('canceled')
+  const slowPoolAgent = slowAgents.find((a) => a.session.header.cwd === slowCwd)
+  checks['执行中取消触发官方 agent.cancel(池会话一次)'] = slowPoolAgent?.cancelCalls.length === 1
+
+  // ── session_list: live + 持久化合并(live 优先) ──
+  const sessList = await rpc(init.sid, { jsonrpc: '2.0', id: 69, method: 'tools/call', params: { name: 'session_list', arguments: {} } })
+  const sl = sessList.status === 200 ? innerOf(sessList) : { total: 0, sessions: [] }
+  checks['session_list: live+持久化合并(快照/裸 header)'] = sl.total >= 3
+    && sl.sessions.some((s) => s.sessionId === 'sess-live2')
+    && sl.sessions.some((s) => s.sessionId === 'sess-persisted')
+    && sl.sessions.some((s) => s.sessionId === 'sess-legacy')
+  const sessListLim = await rpc(init.sid, { jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'session_list', arguments: { limit: 2 } } })
+  const slLim = sessListLim.status === 200 ? innerOf(sessListLim) : { total: 0, sessions: [] }
+  checks['session_list: limit 截断且 total 不变'] = slLim.sessions.length === 2 && slLim.total === sl.total
 
   // 卸载 Phase B(清空池/队列/server), 再起 Phase A
   for (const d of disposers.splice(0)) {
