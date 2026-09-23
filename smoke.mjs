@@ -570,6 +570,19 @@ try {
   checks['select_model: 宿主切换失败透出原因(isError)'] = parsePayload(selFail.text).result?.isError === true
     && String(innerOf(selFail).error ?? '').includes('boom is not routable')
 
+  // ── 传输层路由: GET 独立 SSE 流 + DELETE 会话终止(用一次性会话) ──
+  const init2 = await rpc(undefined, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'smoke-sse', version: '1.0' } } })
+  await rpc(init2.sid, { jsonrpc: '2.0', method: 'notifications/initialized' })
+  const getSse = await fetch(BASE, { method: 'GET', headers: { Accept: 'text/event-stream', 'Mcp-Session-Id': init2.sid } })
+  checks['GET /mcp: 独立 SSE 流(200 + event-stream)'] = getSse.status === 200
+    && String(getSse.headers.get('content-type') ?? '').includes('text/event-stream')
+  getSse.body?.cancel()
+  const delRes = await fetch(BASE, { method: 'DELETE', headers: { 'Mcp-Session-Id': init2.sid } })
+  checks['DELETE /mcp: 会话终止'] = delRes.status === 200 || delRes.status === 204
+  await delRes.text().catch(() => '')
+  const postDel = await rpc(init2.sid, { jsonrpc: '2.0', id: 90, method: 'tools/list', params: {} })
+  checks['DELETE 后旧会话 404'] = postDel.status === 404
+
   // 卸载 Phase B(清空池/队列/server), 再起 Phase A
   for (const d of disposers.splice(0)) {
     if (typeof d === 'function') d()
