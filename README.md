@@ -273,7 +273,7 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
-**0.6.0 (this release) is a large consolidated batch** covering six areas, developed in internal milestones (see the CHANGELOG for the per-milestone detail):
+**The current (unreleased) batch is a large consolidated update** covering six areas, developed in internal milestones (see the CHANGELOG for the per-milestone detail):
 
 - **Protocol conformance**: tool errors carry `isError: true`, Origin-header check + `WWW-Authenticate` challenge join the DNS-rebinding guards, tools expose `title` + `annotations`, transport sessions are reaped (`sessionTtlMs`), 10 MB request-body cap;
 - **Cancellation**: `agent_run` honours MCP `notifications/cancelled` and client timeouts (both wired to the host's official `agent.cancel`);
