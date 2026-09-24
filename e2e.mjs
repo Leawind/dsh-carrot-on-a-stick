@@ -142,7 +142,7 @@ try {
       arguments: {
         task: '用一条命令列出当前目录下的文件名(只要文件名, 不要内容), 然后输出总结。',
         cwd: CWD,
-        title: 'dsh-ops-mcp e2e',
+        title: 'dsh-carrot-on-a-stick e2e',
       },
       _meta: { progressToken: 'pt-e2e' },
     },

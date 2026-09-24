@@ -1066,7 +1066,7 @@ try {
     const handler = gui.get('gui')
     const callGui = (route, { httpMethod = 'GET', headers = {} } = {}) => {
       const req = new EventEmitter()
-      Object.assign(req, { method: httpMethod, url: `/_dsh/dsh-ops-mcp/${route}`, headers })
+      Object.assign(req, { method: httpMethod, url: `/_dsh/dsh-carrot-on-a-stick/${route}`, headers })
       const res = {
         status: 0, headers: {}, body: '',
         writeHead(code, h) { this.status = code; Object.assign(this.headers, h || {}) },

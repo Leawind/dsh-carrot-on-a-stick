@@ -1,5 +1,5 @@
 {
-  "name": "dsh-ops-mcp",
+  "name": "dsh-carrot-on-a-stick",
   "version": "0.1.0",
   "description": "Operate DeepSeek Harness (dsh) over MCP: expose dsh sessions, task execution, and workspace management as an MCP server for any MCP client.",
   "type": "module",
@@ -40,11 +40,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Leawind/dsh-ops-mcp.git"
+    "url": "git+https://github.com/Leawind/dsh-carrot-on-a-stick.git"
   },
-  "homepage": "https://github.com/Leawind/dsh-ops-mcp#readme",
+  "homepage": "https://github.com/Leawind/dsh-carrot-on-a-stick#readme",
   "bugs": {
-    "url": "https://github.com/Leawind/dsh-ops-mcp/issues"
+    "url": "https://github.com/Leawind/dsh-carrot-on-a-stick/issues"
   },
   "dsh": {
     "bundle": {

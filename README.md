@@ -1,15 +1,15 @@
-# dsh-ops-mcp
+# DSH Carrot on a Stick
 
 > Operate [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) over MCP: run an MCP server inside the dsh process and expose session execution, task queues, and workspace management to any MCP client.
 
-[![npm version](https://img.shields.io/npm/v/dsh-ops-mcp)](https://www.npmjs.com/package/dsh-ops-mcp)
-[![license](https://img.shields.io/npm/l/dsh-ops-mcp)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/dsh-carrot-on-a-stick)](https://www.npmjs.com/package/dsh-carrot-on-a-stick)
+[![license](https://img.shields.io/npm/l/dsh-carrot-on-a-stick)](./LICENSE)
 
 > 📖 English (this page) · [中文](./README.zh-CN.md)
 
 ## What it does
 
-dsh ships a complete agent runtime — model routing, tool sandbox, presets, persistent sessions — but it is a Cordis application that external programs cannot call directly. dsh-ops-mcp turns it inside out: the plugin starts an MCP server (StreamableHTTP) inside the dsh process and bridges the live harness through `ctx.agents` / `ctx.agentPresets` / `ctx.tools`.
+dsh ships a complete agent runtime — model routing, tool sandbox, presets, persistent sessions — but it is a Cordis application that external programs cannot call directly. dsh-carrot-on-a-stick turns it inside out: the plugin starts an MCP server (StreamableHTTP) inside the dsh process and bridges the live harness through `ctx.agents` / `ctx.agentPresets` / `ctx.tools`.
 
 **Your MCP client is the commander; dsh is the executor.** Works with Claude Code, Codex CLI, Cursor, another dsh instance (via the official `dsh-mcp-client`), or any automation script.
 
@@ -17,7 +17,7 @@ dsh ships a complete agent runtime — model routing, tool sandbox, presets, per
 MCP client (Claude Code / Codex / another dsh / …)
    │  agent_run / task_* / session_* / model_list / select_model (HTTP + Bearer)
    ▼
-dsh-ops-mcp (MCP server, 127.0.0.1:8090)
+dsh-carrot-on-a-stick (MCP server, 127.0.0.1:8090)
    │  ctx.agents.create → mount preset
    ▼
 dsh agent — full toolset: bash, fs, todo, web…
@@ -28,7 +28,7 @@ dsh agent — full toolset: bash, fs, todo, web…
 ```mermaid
 sequenceDiagram
     participant C as MCP Client
-    participant S as dsh-ops-mcp
+    participant S as dsh-carrot-on-a-stick
     participant A as dsh Agent
     C->>S: tools/call agent_run (task, cwd, _meta.progressToken)
     S->>S: lock (cwd/session) → pool hit or create
@@ -136,10 +136,10 @@ Requires the dsh host to run on **Node.js >= 18** (the plugin declares `engines`
 The plugin must be installed into a dsh **profile directory** (the loader resolves plugin names from there; `--patch` alone from a repo checkout will not find the local package — see finding 1 in the [E2E report](./docs/e2e-0.1.5-rc.2.zh.md)):
 
 ```bash
-git clone https://github.com/Leawind/dsh-ops-mcp.git
-cd dsh-ops-mcp
+git clone https://github.com/Leawind/dsh-carrot-on-a-stick.git
+cd dsh-carrot-on-a-stick
 npm install && npm run build
-npm pack                                        # produces dsh-ops-mcp-<ver>.tgz
+npm pack                                        # produces dsh-carrot-on-a-stick-<ver>.tgz
 
 # install into the profile (Windows note: use the tarball; pnpm mangles file:D:/... specifiers)
 pnpm -C ~/.dsh/profiles/<profile> add -w <path-to-tarball>
@@ -168,7 +168,7 @@ Generic (any streamable-http capable MCP client):
 Let **another dsh** operate this one (add to the peer profile's `cordis.patch.yml`, using the official `dsh-mcp-client`):
 
 ```yaml
-- id: mcp-dsh-ops
+- id: dsh-carrot-on-a-stick
   name: '@deepseek-ai/dsh-mcp-client'
   config:
     serverName: dsh
@@ -182,8 +182,8 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 
 ```yaml
 - insert:
-    - id: dsh-ops-mcp
-      name: 'dsh-ops-mcp'
+    - id: dsh-carrot-on-a-stick
+      name: 'dsh-carrot-on-a-stick'
       config:
         http: true
         port: 8090
@@ -249,7 +249,7 @@ results) to a plaintext file — point it at a location with appropriate filesys
 
 ## Web settings panel
 
-The bundle also injects a settings section into the dsh web UI (**Settings → dsh-ops-mcp**):
+The bundle also injects a settings section into the dsh web UI (**Settings → dsh-carrot-on-a-stick**):
 
 - live status badge (listening / soft-stopped / http disabled) and uptime;
 - the MCP endpoint (click to copy) and **start / stop** buttons — soft stop drains and closes
@@ -258,7 +258,7 @@ The bundle also injects a settings section into the dsh web UI (**Settings → d
 - model / preset / auth / session-TTL / queue-persistence summary and queue counters
   (active / done / failed / cancelled).
 
-The panel talks to the host over same-origin routes under `/_dsh/dsh-ops-mcp/*`; mutating routes
+The panel talks to the host over same-origin routes under `/_dsh/dsh-carrot-on-a-stick/*`; mutating routes
 require same-origin markers, so no extra ports or CORS exposure are needed.
 
 ## Provenance
@@ -267,7 +267,7 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 - drops the Hermes-specific framing — targets any MCP client;
 - tracks current dsh releases (see Roadmap);
-- independent name and repository: `dsh-ops-mcp`.
+- independent name and repository: `dsh-carrot-on-a-stick`.
 
 ## Roadmap / known limitations (against dsh 0.1.5-rc.2)
 

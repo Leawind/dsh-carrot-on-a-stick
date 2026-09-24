@@ -132,7 +132,7 @@
 **自动超时 + 细节打磨**——0.7.0 取消面之上的收尾（Roadmap"无服务端自动超时"就此关闭）：
 
 - **新配置 `taskTimeoutMs`**（默认 `0` = 不启用）：agent turn 执行超过该时长自动走官方
-  `agent.cancel({kind:'hook', reason:'dsh-ops-mcp: task timeout after Xms'})`——与外部取消
+  `agent.cancel({kind:'hook', reason:'dsh-carrot-on-a-stick: task timeout after Xms'})`——与外部取消
   信号合流到同一条 abort 路径；结果 `error` 注明 `task timed out after Xms (official
   agent.cancel fired)`，且整个结果带 `isError: true`。长任务部署请按需调大或保持关闭。
 - `session_list` 机会式读取 live 会话对象的 `title`（sessionTitle 服务维护的字段；没有就
