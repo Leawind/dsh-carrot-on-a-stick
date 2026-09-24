@@ -56,7 +56,7 @@ import { resolve, sep } from 'node:path'
 export const name = 'dsh-ops-mcp'
 
 /** 插件版本(MCP server 握手时上报) */
-const PLUGIN_VERSION = '0.11.9'
+const PLUGIN_VERSION = '0.6.0'
 
 /**
  * 声明依赖的核心服务。

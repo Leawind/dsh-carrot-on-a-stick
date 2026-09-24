@@ -269,19 +269,21 @@ CORS 暴露。
 
 0.2.0 Roadmap 的兼容性问题已在 0.3.0 处理；**0.3.1 完成真机 E2E 验证**（全绿，见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)），并修复 E2E 发现的问题：`{{model}}` 提示词变量（模型选择现经 `agentDefaultModel` 补全）、turn 失败透出、池会话 flush、存量捞回默认关闭、安装流程文档修正。
 **0.5.0 补齐模型选择面**：`model_list`（官方目录 / `llm` 回退）、`agent_run`+`task_inbox` 的按调用覆盖、`select_model`（会话内换模型）、`reasoningEffort`、`allowModelOverride` 门禁、结果自报 `model`、会话池按 `cwd + 模型` 分组。
-**0.6.0 收紧 MCP 协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、GUI 面板显示会话 TTL。
-**0.7.0 补齐取消与可观测面**：`agent_run` 支持 MCP `notifications/cancelled` 取消（接宿主官方 `agent.cancel({kind:'user'})`），新增 `task_cancel` / `task_list` / `session_list`——队列可取消可列举、会话可发现，均为原先的 Roadmap 项。
-**0.8.0 收尾**：可选 `taskTimeoutMs` 自动超时（官方 hook 原因 cancel + error 注明）、`session_list` 回报 live 会话标题、GUI 队列统计细分失败/取消。
-**0.9.0 可选队列持久化**（`queuePersistPath`）：任务状态跨重启保留——已完成结果仍可取回、排队任务重新执行、被打断的如实上报；`running` 状态改为真正开始执行才标记，`task_list` 的排队/执行中从此精确。
-**0.10.0 补齐交互面**：`agent_run` 支持 `notifications/progress` 心跳（规范 `_meta.progressToken`），新增只读 `session_history` 读 live 会话纪要。协议审查报告见 [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md)。
-**0.11.0 会话模型可见性**：`session_list` 回报各会话当前模型选择（已知时），续接前即可确认"这个会话在用哪个模型"。
+**0.6.0（本批次发布，内部开发批次 0.6.0→0.11.9 合并）覆盖六个方向**，逐批细节见 CHANGELOG：
+
+- **协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、10MB 请求体上限；
+- **取消**：`agent_run` 支持 MCP `notifications/cancelled` 与客户端超时（都接到宿主官方 `agent.cancel`）；
+- **可观测**：`notifications/progress` 进度心跳（规范 `_meta.progressToken`）、`task_list`、只读 `session_list`（含当前模型）与 `session_history`（可翻页）；
+- **异步队列**：`task_cancel`、可选持久化（`queuePersistPath`，原子写）、`running`/`interrupted` 状态如实上报；
+- **韧性**：锁表清理、LRU 淘汰跳过活跃会话、损坏持久化文件启动存活；
+- 协议审查报告见 [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md)。
 
 仍然存在的限制：
 
-- [x] ~~任务队列在进程内存中，进程重启丢失~~——0.9.0 加了可选持久化（`queuePersistPath`）；不配置时仍是内存队列。
-- [x] ~~无服务端自动超时~~——0.8.0 加了可选的 `taskTimeoutMs`（默认关闭）；调用方仍可主动取消（`agent_run` 用 MCP `notifications/cancelled`，队列任务用 `task_cancel`）。
-- [x] ~~队列不能列举/取消~~——0.7.0 已补（`task_list` / `task_cancel`）。
-- [x] ~~只读查询面不完整：没有 `session_list`~~——0.7.0 已补（列会话元数据）；0.10.0 再补 `session_history`（live 会话纪要；仅持久化的会话读整日志仍需宿主侧 API）。
+- [x] ~~任务队列在进程内存中，进程重启丢失~~——可选持久化（`queuePersistPath`）已加；不配置时仍是内存队列。
+- [x] ~~无服务端自动超时~~——可选的 `taskTimeoutMs`（默认关闭）已加；调用方仍可主动取消（`agent_run` 用 MCP `notifications/cancelled`，队列任务用 `task_cancel`）。
+- [x] ~~队列不能列举/取消~~——已补（`task_list` / `task_cancel`）。
+- [x] ~~只读查询面不完整：没有 `session_list`~~——已补（列会话元数据 + `session_history` 纪要；仅持久化的会话读整日志仍需宿主侧 API）。
 - [ ] `preset` 仍是部署级配置（一个 MCP server 实例一种 persona），不能按调用指定。
 - [ ] spawn 出的会话里工具调用走宿主 approval 策略（`ask` 下敏感操作可能弹窗或 fail-closed；本次 E2E 的只读操作未受影响）。
 - [ ] `dsh_list_tools` 只列宿主全局注册表；按 agent 作用域列出实际可用工具需要宿主侧 API（ScopeKey 私有符号，零副本原则下拿不到）。
