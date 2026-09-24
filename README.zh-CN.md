@@ -269,7 +269,7 @@ CORS 暴露。
 
 0.2.0 Roadmap 的兼容性问题已在 0.3.0 处理；**0.3.1 完成真机 E2E 验证**（全绿，见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)），并修复 E2E 发现的问题：`{{model}}` 提示词变量（模型选择现经 `agentDefaultModel` 补全）、turn 失败透出、池会话 flush、存量捞回默认关闭、安装流程文档修正。
 **0.5.0 补齐模型选择面**：`model_list`（官方目录 / `llm` 回退）、`agent_run`+`task_inbox` 的按调用覆盖、`select_model`（会话内换模型）、`reasoningEffort`、`allowModelOverride` 门禁、结果自报 `model`、会话池按 `cwd + 模型` 分组。
-**0.6.0（本批次发布，内部开发批次 0.6.0→0.11.9 合并）覆盖六个方向**，逐批细节见 CHANGELOG：
+**本批次（未发布）覆盖六个方向**，逐批细节见 CHANGELOG：
 
 - **协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、10MB 请求体上限；
 - **取消**：`agent_run` 支持 MCP `notifications/cancelled` 与客户端超时（都接到宿主官方 `agent.cancel`）；
