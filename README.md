@@ -273,18 +273,21 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
-**0.6.0 tightened MCP-spec conformance**: tool errors now carry `isError: true`, an Origin-header check joins the DNS-rebinding guards, `401` includes a `WWW-Authenticate` challenge, tools expose `title` + `annotations`, idle transport sessions are reaped (`sessionTtlMs`), and the GUI panel shows the TTL.
-**0.7.0 completed the cancellation & observability surface**: `agent_run` honours the MCP `notifications/cancelled` (wired to the host's official `agent.cancel({kind:'user'})`), and new `task_cancel` / `task_list` / `session_list` tools make the queue listable+cancellable and sessions discoverable — both previously open roadmap items.
-**0.8.0 closed the last roadmap gap in this area**: optional `taskTimeoutMs` auto-timeout (official hook-cause cancel + `error` annotation), `session_list` surfaces live session titles, GUI queue stats split failed/cancelled.
-**0.9.0 added opt-in queue persistence** (`queuePersistPath`): task state survives restarts — finished results stay fetchable, queued tasks re-execute, interrupted running tasks are reported honestly. `running` status is now only set when a task actually starts executing (lock acquired), so `task_list` distinguishes queued from running precisely.
-**0.10.0 completed the interactive surface**: `notifications/progress` heartbeats for `agent_run` (spec `_meta.progressToken`), and a read-only `session_history` tool for live-session transcripts. A full protocol audit is documented in [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md).
+**0.6.0 (this release) is a large consolidated batch** covering six areas, developed in internal milestones (see the CHANGELOG for the per-milestone detail):
+
+- **Protocol conformance**: tool errors carry `isError: true`, Origin-header check + `WWW-Authenticate` challenge join the DNS-rebinding guards, tools expose `title` + `annotations`, transport sessions are reaped (`sessionTtlMs`), 10 MB request-body cap;
+- **Cancellation**: `agent_run` honours MCP `notifications/cancelled` and client timeouts (both wired to the host's official `agent.cancel`);
+- **Observability**: `notifications/progress` heartbeats (spec `_meta.progressToken`), `task_list`, read-only `session_list` (with current model) and `session_history` (paginated);
+- **Async queue**: `task_cancel`, opt-in persistence (`queuePersistPath`, atomic writes), honest `running`/`interrupted` statuses;
+- **Resilience**: lock-table cleanup, LRU eviction skips busy sessions, corrupted persistence file tolerated at startup;
+- A full protocol audit is documented in [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md).
 
 What remains:
 
-- [x] ~~The task queue lives in process memory; a restart loses it~~ — 0.9.0 added opt-in persistence (`queuePersistPath`); without it, the queue is still memory-only.
-- [x] ~~No server-side timeout for `agent_run` / `task_inbox`~~ — 0.8.0 added the opt-in `taskTimeoutMs` (off by default); callers can also cancel actively (`notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks).
-- [x] ~~The queue cannot be listed or cancelled either~~ — done in 0.7.0 (`task_list` / `task_cancel`).
-- [x] ~~Read-only query surface is still incomplete~~ — `session_list` (0.7.0) + `session_history` (0.10.0, live sessions) join `attach_session` / `rename_session` / `select_model`; reading the full log of persisted-only sessions needs a host-side load API.
+- [x] ~~The task queue lives in process memory; a restart loses it~~ — opt-in persistence (`queuePersistPath`) added; without it, the queue is still memory-only.
+- [x] ~~No server-side timeout for `agent_run` / `task_inbox`~~ — the opt-in `taskTimeoutMs` (off by default) fires the host's official cancel; callers can also cancel actively (`notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks).
+- [x] ~~The queue cannot be listed or cancelled either~~ — done (`task_list` / `task_cancel`).
+- [x] ~~Read-only query surface is still incomplete~~ — `session_list` + `session_history` (live sessions) join `attach_session` / `rename_session` / `select_model`; reading the full log of persisted-only sessions needs a host-side load API.
 - [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
 - [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
 - [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
