@@ -1,5 +1,5 @@
 /**
- * dsh-ops-mcp — 在 Harness 内部启动 MCP server, 把 dsh 的操作能力暴露给任意 MCP 客户端。
+ * dsh-carrot-on-a-stick — 在 Harness 内部启动 MCP server, 把 dsh 的操作能力暴露给任意 MCP 客户端。
  *
  * 工具集:
  *   - echo             : 验证 MCP server 连通
@@ -53,7 +53,7 @@ import http from 'node:http'
 import { resolve, sep } from 'node:path'
 
 /** Cordis 插件名 */
-export const name = 'dsh-ops-mcp'
+export const name = 'dsh-carrot-on-a-stick'
 
 /** 插件版本(MCP server 握手时上报) */
 const PLUGIN_VERSION = '0.1.0'
@@ -241,7 +241,7 @@ async function attachToWorkspace(ctx: Context, canonical: string, sessionId: Ses
     const ws = await ensureWorkspace(ctx, canonical)
     if (ws?.attachSession) await ws.attachSession(sessionId)
   } catch (e) {
-    console.warn('[dsh-ops-mcp] workspace attach failed:', (e as Error)?.message ?? e)
+    console.warn('[dsh-carrot-on-a-stick] workspace attach failed:', (e as Error)?.message ?? e)
   }
 }
 
@@ -522,7 +522,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       const ws = await ensureWorkspace(ctx, canonical)
       if (ws?.attachSession) await ws.attachSession(newSessionId)
     } catch (e) {
-      console.warn('[dsh-ops-mcp] workspace attach failed:', String(e))
+      console.warn('[dsh-carrot-on-a-stick] workspace attach failed:', String(e))
     }
   })()
 
@@ -533,7 +533,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
       st?.rename?.(session, title)
     } catch (e) {
-      console.warn('[dsh-ops-mcp] session title set failed:', String(e))
+      console.warn('[dsh-carrot-on-a-stick] session title set failed:', String(e))
     }
   }
 
@@ -827,7 +827,7 @@ async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult> {
     const timeoutTimer = taskTimeoutMs > 0
       ? setTimeout(() => {
         timedOut = true
-        cancelCause = { kind: 'hook', reason: `dsh-ops-mcp: task timeout after ${taskTimeoutMs}ms` }
+        cancelCause = { kind: 'hook', reason: `dsh-carrot-on-a-stick: task timeout after ${taskTimeoutMs}ms` }
         timeoutAbort.abort()
       }, taskTimeoutMs)
       : undefined
@@ -965,7 +965,7 @@ const taskQueue = new Map<string, TaskItem>()
  * 当前 apply 的任务执行器与持久化钩子。taskQueue 是模块级共享, 每次 apply 重新绑定;
  * registerTools 里的 task_inbox/task_cancel/task_list 经这两个钩子操作, 不直接依赖 apply 作用域。
  */
-let runTaskItem: (item: TaskItem) => void = () => { throw new Error('dsh-ops-mcp not applied') }
+let runTaskItem: (item: TaskItem) => void = () => { throw new Error('dsh-carrot-on-a-stick not applied') }
 let persistQueueHook: () => void = () => {}
 
 /** TTL 清理: 删除已完成/失败/已取消且超时的任务(task_inbox/task_list 入口顺带调用) */
@@ -1035,10 +1035,10 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
     try {
       await ws.attachSession(header.id)
       attached++
-      console.log(`[dsh-ops-mcp] 存量捞回: session ${header.id} -> workspace ${ws.path}`)
+      console.log(`[dsh-carrot-on-a-stick] 存量捞回: session ${header.id} -> workspace ${ws.path}`)
     } catch (e) {
       failed++
-      console.warn(`[dsh-ops-mcp] 存量捞回失败 session ${header.id}:`, (e as Error)?.message ?? e)
+      console.warn(`[dsh-carrot-on-a-stick] 存量捞回失败 session ${header.id}:`, (e as Error)?.message ?? e)
     }
   }
   return { attached, failed }
@@ -1617,8 +1617,8 @@ interface McpConnection {
   requests: number
 }
 
-/** GUI 路由前缀: /_dsh/dsh-ops-mcp/<method>, 与 bottom-info-bar 同约定 */
-const WEB_ROUTE_PREFIX = '/_dsh/dsh-ops-mcp'
+/** GUI 路由前缀: /_dsh/dsh-carrot-on-a-stick/<method>, 与 bottom-info-bar 同约定 */
+const WEB_ROUTE_PREFIX = '/_dsh/dsh-carrot-on-a-stick'
 
 /** JSON 响应(GUI 路由) */
 function webRespond(res: http.ServerResponse, status: number, payload: unknown): void {
@@ -1734,7 +1734,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         await writeFile(tmp, JSON.stringify([...taskQueue.values()]))
         await rename(tmp, persistPath)
       })
-      .catch((e) => console.warn('[dsh-ops-mcp] queue persist failed:', (e as Error)?.message ?? e))
+      .catch((e) => console.warn('[dsh-carrot-on-a-stick] queue persist failed:', (e as Error)?.message ?? e))
   }
   persistQueueHook = persistQueue
   runTaskItem = (item: TaskItem) => {
@@ -1790,10 +1790,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       for (const item of [...taskQueue.values()]) {
         if (item.status === 'queued') runTaskItem(item)
       }
-      if (restored > 0) console.log(`[dsh-ops-mcp] queue restored from ${persistPath}: ${restored} items`)
+      if (restored > 0) console.log(`[dsh-carrot-on-a-stick] queue restored from ${persistPath}: ${restored} items`)
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-        console.warn('[dsh-ops-mcp] queue restore failed:', (e as Error)?.message ?? e)
+        console.warn('[dsh-carrot-on-a-stick] queue restore failed:', (e as Error)?.message ?? e)
       }
     }
   }
@@ -1828,9 +1828,9 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     void (async () => {
       try {
         const r = await reattachOrphanSessions(ctx)
-        console.log(`[dsh-ops-mcp] 存量捞回完成: attached=${r.attached} failed=${r.failed}`)
+        console.log(`[dsh-carrot-on-a-stick] 存量捞回完成: attached=${r.attached} failed=${r.failed}`)
       } catch (e) {
-        console.warn('[dsh-ops-mcp] 存量捞回异常:', (e as Error)?.message ?? e)
+        console.warn('[dsh-carrot-on-a-stick] 存量捞回异常:', (e as Error)?.message ?? e)
       }
     })()
   }
@@ -1843,7 +1843,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       agentLocks.clear()
       taskQueue.clear()
     }
-  }, 'dsh-ops-mcp')
+  }, 'dsh-carrot-on-a-stick')
 
   // ── MCP server 观测与软停启(http:false 时仅保留 GUI 控制面) ──
   const startedAt = Date.now()
@@ -1953,7 +1953,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     transports.clear()
     servers.clear()
     connections.clear()
-    console.log(`[dsh-ops-mcp] MCP server stopped (soft stop, ${host}:${port})`)
+    console.log(`[dsh-carrot-on-a-stick] MCP server stopped (soft stop, ${host}:${port})`)
     return { stopped: true }
   }
 
@@ -1964,14 +1964,14 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     try {
       await listenOnce()
       listening = true
-      console.log(`[dsh-ops-mcp] MCP server listening on ${host}:${port}/mcp (soft start)`)
+      console.log(`[dsh-carrot-on-a-stick] MCP server listening on ${host}:${port}/mcp (soft start)`)
       return { started: true }
     } catch (e) {
       return { started: false, error: (e as Error)?.message ?? String(e) }
     }
   }
 
-  // ── GUI 控制面: webServer 路由 /_dsh/dsh-ops-mcp/<method>(设置页面板的数据/操作后端) ──
+  // ── GUI 控制面: webServer 路由 /_dsh/dsh-carrot-on-a-stick/<method>(设置页面板的数据/操作后端) ──
   const WEB_ROUTES: Record<string, () => unknown> = {
     status: () => statusSnapshot(),
     stop: () => stopMcpServer(),
@@ -2012,19 +2012,19 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         },
       })
       return () => { dispose() }
-    }, 'dsh-ops-mcp: web routes')
+    }, 'dsh-carrot-on-a-stick: web routes')
   })
 
   // http: false 显式关闭 MCP 监听(GUI 控制面仍可用: 面板显示"未监听", 可看配置但不可启动)
   if (config.http === false) {
-    console.log('[dsh-ops-mcp] http disabled by config, MCP server not started (web panel still available)')
+    console.log('[dsh-carrot-on-a-stick] http disabled by config, MCP server not started (web panel still available)')
     return
   }
 
   server = http.createServer(async (req, res) => {
     // Bearer token 认证(配置了 authToken 时强制所有请求校验, 常数时间比较; 401 带 WWW-Authenticate 挑战)
     if (!bearerOk(req)) {
-      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer realm="dsh-ops-mcp"' })
+      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer realm="dsh-carrot-on-a-stick"' })
       res.end(jsonrpcError(-32001, 'Unauthorized'))
       return
     }
@@ -2137,10 +2137,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // 等待 listen 完成: 端口被占/EADDRNOTAVAIL 时 apply 直接抛错, 插件启动失败可见(不再静默成功)
   await listenOnce()
   listening = true
-  console.log(`[dsh-ops-mcp] MCP server listening on ${host}:${port}/mcp`)
+  console.log(`[dsh-carrot-on-a-stick] MCP server listening on ${host}:${port}/mcp`)
   // 运行期错误(如 socket 异常)记日志不崩进程
   server.on('error', (e) => {
-    console.error('[dsh-ops-mcp] HTTP server error:', e.message)
+    console.error('[dsh-carrot-on-a-stick] HTTP server error:', e.message)
   })
 
   // 卸载时关 server + 清空 transport/server/连接映射(与上面的池/队列清理同属一个 effect 链)
@@ -2158,5 +2158,5 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       servers.clear()
       connections.clear()
     }
-  }, 'dsh-ops-mcp')
+  }, 'dsh-carrot-on-a-stick')
 }

@@ -1,5 +1,5 @@
 /**
- * dsh-ops-mcp — 在 Harness 内部启动 MCP server, 把 dsh 的操作能力暴露给任意 MCP 客户端。
+ * dsh-carrot-on-a-stick — 在 Harness 内部启动 MCP server, 把 dsh 的操作能力暴露给任意 MCP 客户端。
  *
  * 工具集:
  *   - echo             : 验证 MCP server 连通
@@ -36,7 +36,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
-export declare const name = "dsh-ops-mcp";
+export declare const name = "dsh-carrot-on-a-stick";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——

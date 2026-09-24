@@ -1,15 +1,15 @@
-# dsh-ops-mcp
+# DSH Carrot on a Stick
 
 > 通过 MCP 操作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）：在 dsh 进程内启动一个 MCP server，把会话执行、任务队列、工作区管理能力暴露出来，任何 MCP 客户端都能调用。
 
-[![npm version](https://img.shields.io/npm/v/dsh-ops-mcp)](https://www.npmjs.com/package/dsh-ops-mcp)
-[![license](https://img.shields.io/npm/l/dsh-ops-mcp)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/dsh-carrot-on-a-stick)](https://www.npmjs.com/package/dsh-carrot-on-a-stick)
+[![license](https://img.shields.io/npm/l/dsh-carrot-on-a-stick)](./LICENSE)
 
 > 📖 [English](./README.md) · 中文（当前页）
 
 ## 它解决什么问题
 
-dsh 自带完整的 agent 运行时——模型路由、工具沙箱、预设、会话持久化——但它是一个 Cordis 应用，外部程序无法直接调用。dsh-ops-mcp 把它「由内向外」翻转：插件在 dsh 进程内启动 MCP server（StreamableHTTP），通过 `ctx.agents` / `ctx.agentPresets` / `ctx.tools` 桥接运行中的 harness。
+dsh 自带完整的 agent 运行时——模型路由、工具沙箱、预设、会话持久化——但它是一个 Cordis 应用，外部程序无法直接调用。dsh-carrot-on-a-stick 把它「由内向外」翻转：插件在 dsh 进程内启动 MCP server（StreamableHTTP），通过 `ctx.agents` / `ctx.agentPresets` / `ctx.tools` 桥接运行中的 harness。
 
 **你的 MCP 客户端是指挥官，dsh 是执行者。** 适配的客户端包括且不限于：Claude Code、Codex CLI、Cursor、另一个 dsh 实例（经官方 `dsh-mcp-client` 挂接）、任何自动化脚本。
 
@@ -17,7 +17,7 @@ dsh 自带完整的 agent 运行时——模型路由、工具沙箱、预设、
 MCP 客户端（Claude Code / Codex / 另一个 dsh / …）
    │  agent_run / task_inbox / task_result / model_list / select_model (HTTP + Bearer)
    ▼
-dsh-ops-mcp（MCP server, 127.0.0.1:8090）
+dsh-carrot-on-a-stick（MCP server, 127.0.0.1:8090）
    │  ctx.agents.create → 挂载 preset
    ▼
 dsh agent —— 完整工具集：bash、fs、todo、web…
@@ -28,7 +28,7 @@ dsh agent —— 完整工具集：bash、fs、todo、web…
 ```mermaid
 sequenceDiagram
     participant C as MCP 客户端
-    participant S as dsh-ops-mcp
+    participant S as dsh-carrot-on-a-stick
     participant A as dsh Agent
     C->>S: tools/call agent_run (task, cwd, _meta.progressToken)
     S->>S: 锁(cwd/session) → 池命中或新建
@@ -135,10 +135,10 @@ sequenceDiagram
 插件以包形式装进 dsh 的 **profile 目录**（loader 从那里解析插件名；在仓库根直接 `--patch` 是找不到本地包的——见 [E2E 记录](./docs/e2e-0.1.5-rc.2.zh.md) 发现 1）：
 
 ```bash
-git clone https://github.com/Leawind/dsh-ops-mcp.git
-cd dsh-ops-mcp
+git clone https://github.com/Leawind/dsh-carrot-on-a-stick.git
+cd dsh-carrot-on-a-stick
 npm install && npm run build
-npm pack                                        # 产出 dsh-ops-mcp-<ver>.tgz
+npm pack                                        # 产出 dsh-carrot-on-a-stick-<ver>.tgz
 
 # 装进 profile(Windows 注意: 用 tarball, pnpm 对 file:D:/... 形式会拼坏路径)
 pnpm -C ~/.dsh/profiles/<profile> add -w <tarball 路径>
@@ -167,7 +167,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 让**另一个 dsh** 操作这个 dsh（对端 profile 的 `cordis.patch.yml`，走官方 `dsh-mcp-client`）：
 
 ```yaml
-- id: mcp-dsh-ops
+- id: dsh-carrot-on-a-stick
   name: '@deepseek-ai/dsh-mcp-client'
   config:
     serverName: dsh
@@ -181,8 +181,8 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 
 ```yaml
 - insert:
-    - id: dsh-ops-mcp
-      name: 'dsh-ops-mcp'
+    - id: dsh-carrot-on-a-stick
+      name: 'dsh-carrot-on-a-stick'
       config:
         http: true
         port: 8090
@@ -246,7 +246,7 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 
 ## Web 设置面板
 
-bundle 还会向 dsh Web UI 注入一个设置区（**设置 → dsh-ops-mcp**）：
+bundle 还会向 dsh Web UI 注入一个设置区（**设置 → dsh-carrot-on-a-stick**）：
 
 - 实时状态徽章（监听中 / 已软停 / http 关闭）与运行时长；
 - MCP 端点（点击复制）与**停止 / 启动**按钮——软停止会排空并干净关闭，启动重新监听
@@ -254,7 +254,7 @@ bundle 还会向 dsh Web UI 注入一个设置区（**设置 → dsh-ops-mcp**�
 - 已连接的 MCP 客户端：会话 id、User-Agent、连接时间、最近活跃、请求数；
 - 模型 / preset / 认证 / 会话 TTL / 队列持久化摘要，以及队列计数（活跃 / 完成 / 失败 / 取消）。
 
-面板经同源路由 `/_dsh/dsh-ops-mcp/*` 与宿主通信；变更类路由要求同源标识，无需额外端口或
+面板经同源路由 `/_dsh/dsh-carrot-on-a-stick/*` 与宿主通信；变更类路由要求同源标识，无需额外端口或
 CORS 暴露。
 
 ## 源码来源
@@ -263,7 +263,7 @@ CORS 暴露。
 
 - **去 Hermes 化**：面向任意 MCP 客户端（Claude Code / Codex / Cursor / 另一个 dsh / 自动化脚本）；
 - **贴合当前版本 dsh**：见下方 Roadmap；
-- **独立命名与仓库**：`dsh-ops-mcp`。
+- **独立命名与仓库**：`dsh-carrot-on-a-stick`。
 
 ## Roadmap / 已知限制（对 dsh 0.1.5-rc.2）
 

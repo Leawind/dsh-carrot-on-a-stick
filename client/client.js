@@ -1,13 +1,13 @@
-window.__ModuleLoader__.load({ id: 'dsh-ops-mcp', factory: (require) => {
+window.__ModuleLoader__.load({ id: 'dsh-carrot-on-a-stick', factory: (require) => {
   var module = { exports: {} }; var exports = module.exports;
-  // dsh-ops-mcp — client half(浏览器, 静态 bundle 形态)
-  // - 数据/操作全部经 GUI 同源路由: POST /_dsh/dsh-ops-mcp/{status|stop|start}(host 半注册)
+  // dsh-carrot-on-a-stick — client half(浏览器, 静态 bundle 形态)
+  // - 数据/操作全部经 GUI 同源路由: POST /_dsh/dsh-carrot-on-a-stick/{status|stop|start}(host 半注册)
   // - 注册 settings.section 设置页面板: 状态查看 / 软停启 / 连接中的 MCP 客户端列表
   // - React 由模块系统种子提供; 不依赖其它 client 包(纯内联样式, 双主题中性配色)
   'use strict';
 
   const React = require('react');
-  const RPC_BASE = '/_dsh/dsh-ops-mcp';
+  const RPC_BASE = '/_dsh/dsh-carrot-on-a-stick';
 
   function rpc(method, args) {
     return fetch(RPC_BASE + '/' + method, {
@@ -141,7 +141,7 @@ window.__ModuleLoader__.load({ id: 'dsh-ops-mcp', factory: (require) => {
       // 头部: 状态徽章 + 标题/版本 + 操作
       React.createElement('div', { style: S.header },
         React.createElement(Badge, { ok: !!state.listening, warn: state.httpEnabled !== false }),
-        React.createElement('span', { style: S.title }, 'dsh-ops-mcp'),
+        React.createElement('span', { style: S.title }, 'dsh-carrot-on-a-stick'),
         React.createElement('span', { style: S.version }, 'v' + (state.version || '?')),
         React.createElement('span', { style: { flex: 1 } }),
         state.listening
@@ -202,12 +202,12 @@ window.__ModuleLoader__.load({ id: 'dsh-ops-mcp', factory: (require) => {
         slots = ctx.slots || ctx.get('slots');
       }
       if (slots === undefined) {
-        console.warn('[dsh-ops-mcp] slots 服务 40s 内未就绪, 设置面板未注册');
+        console.warn('[dsh-carrot-on-a-stick] slots 服务 40s 内未就绪, 设置面板未注册');
         return;
       }
       slots.inject('settings.section', function () {
         return slots.register(
-          { name: 'settings.section', id: 'dsh-ops-mcp', order: 110, label: function () { return 'dsh-ops-mcp（MCP 服务）'; } },
+          { name: 'settings.section', id: 'dsh-carrot-on-a-stick', order: 110, label: function () { return "dsh-carrot-on-a-stick（MCP 服务）"; } },
           function () { return React.createElement(StatusPanel); },
         );
       });
