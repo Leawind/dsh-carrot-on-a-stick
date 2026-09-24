@@ -141,8 +141,7 @@ cd dsh-carrot-on-a-stick
 npm install && npm run build
 npm pack                                        # produces dsh-carrot-on-a-stick-<ver>.tgz
 
-# install into the profile (Windows note: use the tarball; pnpm mangles file:D:/... specifiers)
-pnpm -C ~/.dsh/profiles/<profile> add -w <path-to-tarball>
+dsh plugin --profile web add "<path_to_tgz>" -w
 
 export DEEPSEEK_API_KEY=...                     # model credentials (or use what ~/.dsh already stores)
 dsh --profile <profile> --patch ./cordis.yml --no-open --port 3081

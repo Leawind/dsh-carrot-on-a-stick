@@ -140,8 +140,7 @@ cd dsh-carrot-on-a-stick
 npm install && npm run build
 npm pack                                        # 产出 dsh-carrot-on-a-stick-<ver>.tgz
 
-# 装进 profile(Windows 注意: 用 tarball, pnpm 对 file:D:/... 形式会拼坏路径)
-pnpm -C ~/.dsh/profiles/<profile> add -w <tarball 路径>
+dsh plugin --profile web add "<path_to_tgz>" -w
 
 export DEEPSEEK_API_KEY=...                     # 模型凭证(或用 ~/.dsh 里已保存的)
 dsh --profile <profile> --patch ./cordis.yml --no-open --port 3081
