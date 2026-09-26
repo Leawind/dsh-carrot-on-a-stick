@@ -514,6 +514,18 @@ try {
   const hlim = histLim.status === 200 ? innerOf(histLim) : { turns: [] }
   checks['session_history: limit 截断且时间正序'] = hlim.turns?.length === 2 && hlim.turns[0].index < hlim.turns[1].index
 
+  // roles 过滤: 只取指定类型的轮次, limit 按过滤后的条数计数; 缺省 = 全部类型
+  const histRoles = await rpc(init.sid, { jsonrpc: '2.0', id: 93, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', roles: ['assistant'] } } })
+  const hRoles = histRoles.status === 200 ? innerOf(histRoles) : { turns: [] }
+  checks['session_history: roles 只取 assistant(无工具噪声)'] = Array.isArray(hRoles.turns) && hRoles.turns.length > 0
+    && hRoles.turns.every((t) => t.role === 'assistant')
+  const histRolesLim = await rpc(init.sid, { jsonrpc: '2.0', id: 94, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', roles: ['assistant'], limit: 2 } } })
+  const hRolesLim = histRolesLim.status === 200 ? innerOf(histRolesLim) : { turns: [] }
+  checks['session_history: roles 过滤下 limit 按过滤后计数'] = hRolesLim.turns?.length === 2 && hRolesLim.turns.every((t) => t.role === 'assistant')
+  const histRolesPage = await rpc(init.sid, { jsonrpc: '2.0', id: 95, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', roles: ['user'], limit: 5 } } })
+  const hRolesPage = histRolesPage.status === 200 ? innerOf(histRolesPage) : { turns: [] }
+  checks['session_history: roles 过滤 + beforeIndex 翻页仍可用'] = Array.isArray(hRolesPage.turns) && hRolesPage.turns.every((t) => t.role === 'user')
+
   // beforeIndex 翻页: 从上次最早 index 之前继续往回取
   const histPage1 = await rpc(init.sid, { jsonrpc: '2.0', id: 89, method: 'tools/call', params: { name: 'session_history', arguments: { sessionId: 'sess-live', limit: 2 } } })
   const page1 = histPage1.status === 200 ? innerOf(histPage1) : { turns: [] }

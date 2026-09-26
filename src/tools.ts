@@ -22,6 +22,7 @@ import { state, sweepExpiredTasks } from './state.js'
 import type { ModelSelection, ModelSelectionOverride, TaskItem } from './types.js'
 import { canonicalCwd, canonicalizeAllowedCwd, isWithin, sessionCwdRefusal } from './paths.js'
 import { DETAIL_ARG, historyTurnsOf, projectModel, renderResult } from './projection.js'
+import type { HistoryRole } from './projection.js'
 import { executeTask, hostDefaultSelection, knownSelectionOf, rekeyPooledSession, resolveLiveAgent, selectionOverrideOf } from './engine.js'
 import { asSessionId, ensureWorkspace, eventsOf, findSessionHeader, headerOfSnapshot, serviceOf, userMessage } from './host.js'
 import { GET_STARTED_DOC, guideSectionDoc, type GuideSection } from './onboarding.js'
@@ -269,7 +270,7 @@ async function collectSessions(ctx: Context, cwd?: string): Promise<{ total: num
 }
 
 /** session_history / dsh://sessions/{id}/history 的共享实现(工具与资源同数据同边界)。不可读时抛错。 */
-async function sessionHistoryPayload(ctx: Context, sessionId: string, limit: number, beforeIndex?: number): Promise<Record<string, unknown>> {
+async function sessionHistoryPayload(ctx: Context, sessionId: string, limit: number, beforeIndex?: number, roles?: HistoryRole[]): Promise<Record<string, unknown>> {
   const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
   const session = sessions?.get?.(sessionId)
   if (!session) {
@@ -281,7 +282,7 @@ async function sessionHistoryPayload(ctx: Context, sessionId: string, limit: num
     if (refusal) throw new Error(refusal)
   }
   const events = eventsOf(session)
-  return { sessionId, totalEvents: events.length, turns: historyTurnsOf(events, limit, beforeIndex) }
+  return { sessionId, totalEvents: events.length, turns: historyTurnsOf(events, limit, beforeIndex, roles) }
 }
 
 // ── 结构化输出 schema: 用 zod 定义一份, JSON Schema(tools/list 下发)与返回值校验都由它派生, 不手写 JSON Schema ──
@@ -713,17 +714,18 @@ export function registerTools(mcp: McpServer, ctx: Context, deps?: ToolDeps): vo
     'session_history',
     {
       title: 'Session history',
-      description: '读取一个 live 会话的对话纪要(user/assistant/tool_call/tool_result/turn_end 轮次, 从最新往回取, 文本截断)。支持 beforeIndex 向更早翻页(上次结果最早的 index)。配置 workspaceRoots 时, 白名单外会话不可读。只支持内存中的 live 会话; 已持久化但不在内存的会话, 宿主未暴露整日志加载 API, 无法读取。',
+      description: '读取一个 live 会话的对话纪要(user/assistant/tool_call/tool_result/turn_end 轮次, 从最新往回取, 文本截断)。roles 可只取指定类型(如只看回答传 ["assistant"], 排查问题再取 tool_call/tool_result); 缺省返回全部类型, limit 按过滤后的条数计数。支持 beforeIndex 向更早翻页(上次结果最早的 index)。配置 workspaceRoots 时, 白名单外会话不可读。只支持内存中的 live 会话; 已持久化但不在内存的会话, 宿主未暴露整日志加载 API, 无法读取。',
       inputSchema: {
         sessionId: z.string().describe('会话 id(live; 来自 agent_run 结果或 session_list)'),
         limit: z.number().int().min(1).max(50).optional().describe('最多返回轮数(默认 10)'),
+        roles: z.array(z.enum(['user', 'assistant', 'tool_call', 'tool_result', 'turn_end'])).optional().describe('只返回这些类型的轮次; 缺省 = 全部类型'),
         beforeIndex: z.number().int().min(0).optional().describe('从该事件序号之前往回取(翻页: 传上次结果最早的 index)'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ sessionId, limit, beforeIndex }) => {
+    async ({ sessionId, limit, roles, beforeIndex }) => {
       try {
-        return out(JSON.stringify(await sessionHistoryPayload(ctx, sessionId, limit ?? 10, beforeIndex)))
+        return out(JSON.stringify(await sessionHistoryPayload(ctx, sessionId, limit ?? 10, beforeIndex, roles)))
       } catch (e) {
         return outError(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
       }

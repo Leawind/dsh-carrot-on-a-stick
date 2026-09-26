@@ -5,6 +5,19 @@
 > 0.5.0 之后的全部工作（尚未发布）。以下按开发批次（先后顺序）组织，
 > **时间倒序**排列（批次 1 的完整条目在本节末尾）。
 
+### 批次 22: session_history 支持 roles 按轮次类型过滤
+
+- **`session_history` 新增 `roles` 参数**：调用方自行决定查看哪些轮次类型
+  （`user` / `assistant` / `tool_call` / `tool_result` / `turn_end` 的任意子集）——
+  典型场景"下发指令等完成、只关心最终回答"传 `["assistant"]` 即可跳过工具噪声；
+  排查问题时再取 `tool_call` / `tool_result`。缺省不传 = 全部类型，行为不变。
+  `limit` 按**过滤后**的条数计数（"最近 2 条回答"而非"最近 2 个事件里恰好有几条回答"），
+  与 `beforeIndex` 翻页正交组合。核心过滤在 `historyTurnsOf`（projection.ts），
+  工具面与 `sessionHistoryPayload` 只透传；资源 `dsh://sessions/{id}/history` 保持
+  全类型不动（面向人阅读，工具面才面向 agent）。
+- smoke 新增 3 项断言：roles 只取 assistant 无工具噪声、roles 过滤下 limit 按过滤后计数、
+  roles 过滤与翻页组合。
+
 ### 批次 21: 结构化输出(outputSchema) + CI node 矩阵修复 + 内层 agent 执行合同
 
 - **list 类工具带 `outputSchema` / `structuredContent`**（MCP 2025-06-18 结构化输出）：

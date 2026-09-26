@@ -59,7 +59,7 @@ sequenceDiagram
 | `task_list` | list queued/running/finished tasks (queue observability) |
 | `task_cancel` | cancel a queued or running task (a running one is cancelled through the host's official `agent.cancel`) |
 | `session_list` | list known sessions (live + persisted, newest first) to pick `sessionId`s for continuation |
-| `session_history` | read a live session's transcript summary (user/assistant/tool turns, newest first, truncated) |
+| `session_history` | read a live session's transcript summary (user/assistant/tool turns, newest first, truncated); pass `roles` to keep only the types you need (e.g. `["assistant"]` to skip tool noise) |
 | `select_model` | switch the model of an **existing session** (official `sessionController.selectModel` path) |
 | `attach_session` | attach a session to the workspace of its cwd |
 | `rename_session` | rename an existing session |
@@ -127,6 +127,7 @@ Continue it later with `"sessionId": "<from the result>"` — send only the delt
 ```json
 { "name": "session_list", "arguments": { "limit": 10 } }                // sessionId / title / cwd / model
 { "name": "session_history", "arguments": { "sessionId": "…" } }        // recent turns, truncated
+{ "name": "session_history", "arguments": { "sessionId": "…", "roles": ["assistant"] } }  // answers only, skip tool noise
 { "name": "select_model", "arguments": { "sessionId": "…", "provider": "…", "model": "…" } }
 ```
 

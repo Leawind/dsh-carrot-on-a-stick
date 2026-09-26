@@ -91,7 +91,8 @@ export const GET_STARTED_SECTIONS: Record<Exclude<GuideSection, 'all'>, string> 
 4. **Real-time steering** — \`agent_steer\` on a running sessionId/taskId: mode=steer
    redirects within the current turn; mode=inject queues context without waking the driver.
 5. **Find and inspect sessions** — \`session_list\` (optionally filtered by cwd),
-   \`session_history\` for recent turns, \`select_model\` to switch models in place,
+   \`session_history\` for recent turns (pass \`roles\` to keep only the turn types you
+   need, e.g. \`["assistant"]\` to skip tool noise), \`select_model\` to switch models in place,
    \`rename_session\` / \`attach_session\` for housekeeping.
 6. **Token-cheap browsing** — MCP resources mirror the read tools (\`dsh://status\`,
    \`dsh://queue\`, \`dsh://sessions\`, \`dsh://sessions/{id}/history\`, \`dsh://guide\`) for

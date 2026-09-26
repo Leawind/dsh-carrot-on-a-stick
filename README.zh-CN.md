@@ -59,7 +59,7 @@ sequenceDiagram
 | `task_list` | 列出队列中的任务（排队/执行中/已结束；队列可观测） |
 | `task_cancel` | 取消排队或执行中的任务（执行中走宿主官方 `agent.cancel`） |
 | `session_list` | 列出已知会话元数据（live+持久化合并，按创建时间倒序），供挑选续接的 `sessionId` |
-| `session_history` | 读 live 会话的对话纪要（user/assistant/tool 轮次，从最新往回取，文本截断） |
+| `session_history` | 读 live 会话的对话纪要（user/assistant/tool 轮次，从最新往回取，文本截断）；`roles` 可只取指定类型（如 `["assistant"]` 只看回答，跳过工具噪声） |
 | `select_model` | 切换**已存在会话**使用的模型（官方 `sessionController.selectModel` 路径） |
 | `attach_session` | 把会话归组到其 cwd 对应的工作区 |
 | `rename_session` | 给已有会话改名 |
@@ -127,6 +127,7 @@ sequenceDiagram
 ```json
 { "name": "session_list", "arguments": { "limit": 10 } }                // sessionId / 标题 / cwd / 模型
 { "name": "session_history", "arguments": { "sessionId": "…" } }        // 最近轮次（截断）
+{ "name": "session_history", "arguments": { "sessionId": "…", "roles": ["assistant"] } }  // 只要回答，跳过工具噪声
 { "name": "select_model", "arguments": { "sessionId": "…", "provider": "…", "model": "…" } }
 ```
 

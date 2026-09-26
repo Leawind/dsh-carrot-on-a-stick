@@ -126,30 +126,39 @@ export function extractTexts(value: unknown, acc: string[] = []): string[] {
   return acc
 }
 
+export type HistoryRole = 'user' | 'assistant' | 'tool_call' | 'tool_result' | 'turn_end'
+
 /**
  * 会话事件 → 轮次纪要(从 newest 往回取 limit 条, 返回时按时间正序排列)。
  * beforeIndex: 只考虑序号小于该值的事件——配合上次结果的最早 index 实现向更早翻页。
+ * roles: 只保留命中类型的轮次, limit 按过滤后的条数计数; 缺省 = 全部类型。
  * 事件形状与 executeTask 的解析一致: assistant/message, user/message, tool/call, tool/result, turn/end。
  * 长文本按角色截断, 防止整段历史灌穿调用方上下文。
  */
-export function historyTurnsOf(events: readonly unknown[], limit: number, beforeIndex?: number): Record<string, unknown>[] {
+export function historyTurnsOf(events: readonly unknown[], limit: number, beforeIndex?: number, roles?: readonly HistoryRole[]): Record<string, unknown>[] {
+  const want = roles ? new Set<string>(roles) : undefined
   const turns: Record<string, unknown>[] = []
   const start = Math.min(beforeIndex ?? events.length, events.length)
   for (let i = start - 1; i >= 0 && turns.length < limit; i--) {
     const ev = events[i] as { type?: string; data?: unknown } | undefined
     if (ev?.type === 'assistant/message') {
+      if (want && !want.has('assistant')) continue
       const d = ev.data as { message?: { content?: { type?: string; text?: string }[] } } | undefined
       const text = (d?.message?.content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join('\n')
       if (text.trim()) turns.unshift({ index: i, role: 'assistant', text: clip(text, 600) })
     } else if (ev?.type === 'user/message') {
+      if (want && !want.has('user')) continue
       turns.unshift({ index: i, role: 'user', text: clip(extractTexts(ev.data).join('\n'), 200) })
     } else if (ev?.type === 'tool/call') {
+      if (want && !want.has('tool_call')) continue
       const d = ev.data as { name?: string; arguments?: string; input?: unknown } | undefined
       turns.unshift({ index: i, role: 'tool_call', name: d?.name ?? '?', args: clip(String(d?.arguments ?? JSON.stringify(d?.input ?? null) ?? ''), 200) })
     } else if (ev?.type === 'tool/result') {
+      if (want && !want.has('tool_result')) continue
       const texts = extractTexts(ev.data ?? ev).join('\n')
       if (texts.trim()) turns.unshift({ index: i, role: 'tool_result', text: clip(texts, 300) })
     } else if (ev?.type === 'turn/end') {
+      if (want && !want.has('turn_end')) continue
       const d = ev.data as { turn?: number; reason?: { kind?: string } } | undefined
       turns.unshift({ index: i, role: 'turn_end', kind: d?.reason?.kind ?? '?' })
     }
