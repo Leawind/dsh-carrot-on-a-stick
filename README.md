@@ -46,11 +46,15 @@ sequenceDiagram
 
 | Tool | Purpose |
 |---|---|
+| `dsh_get_started` | **call this first if you are new to dsh** — concept glossary, workflow recipes, and an error→alternative-path cheat sheet (static markdown; also summarized in the server's `instructions` at initialize) |
 | `echo` | connectivity check |
 | `dsh_list_tools` | list the host-global tool registry (name + description; model tools are preset-scoped, usually empty) |
+| `dsh_status` | plugin status snapshot: version / listening / uptime / config summary / queue counters / resident agents / connected clients (same data as the web panel) |
+| `workspace_list` | list registered workspaces (id / path / member sessions) |
 | `model_list` | list currently routable providers, model ids, reasoning efforts, and the default selection (look here before picking a model) |
-| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `detail` controls result size; cancellable via the MCP `notifications/cancelled` (the host agent's official `cancel` is invoked); reports `notifications/progress` heartbeats when the caller passes `_meta.progressToken` |
-| `task_inbox` | push a structured task (task + context + cwd + model) into the async queue, returns `taskId` |
+| `agent_run` | run a task synchronously, structured result; `sessionId` continues a session; `provider`/`model`/`reasoningEffort` pick this run's model; `preset` picks the persona for a **new** session; `detail` controls result size; cancellable via the MCP `notifications/cancelled` (the host agent's official `cancel` is invoked); reports `notifications/progress` heartbeats when the caller passes `_meta.progressToken` |
+| `agent_steer` | real-time intervention on a running agent — `mode=steer` (default) delivers steering consumed at the next step boundary of the current turn; `mode=inject` queues model-facing context without waking the driver; target is `sessionId` (pooled/live) or `taskId` (a running queue task); steering an idle session is refused (use `agent_run`) |
+| `task_inbox` | push a structured task (task + context + cwd + model + preset) into the async queue, returns `taskId` |
 | `task_result` | fetch a queued task's result; `detail=status` is a lightweight poll that never re-injects the payload |
 | `task_list` | list queued/running/finished tasks (queue observability) |
 | `task_cancel` | cancel a queued or running task (a running one is cancelled through the host's official `agent.cancel`) |
@@ -76,8 +80,10 @@ Three ways to change models:
 
 Two source semantics worth knowing:
 
-- **The resident session pool is keyed by `cwd + model triple`.** Task 1 on model A and task 2 on model B in the same directory are two separate sessions (no shared context), so which model a session uses is always predictable; to switch models inside one session, use `select_model`.
-- Results now carry `model: {provider, model, reasoningEffort?}` so the caller never has to guess who answered.
+- **The resident session pool is keyed by `cwd + model triple + preset`.** Task 1 on model A and task 2 on model B in the same directory are two separate sessions (no shared context), so which model a session uses is always predictable; to switch models inside one session, use `select_model`.
+- Results now carry `model: {provider, model, reasoningEffort?}` (and `preset` when known) so the caller never has to guess who answered.
+
+**Per-call preset (persona)** — `agent_run` / `task_inbox` accept a `preset` argument (an id from the `agentPresets` roster) for **newly created sessions**; the pool keys by it, so a "worker" agent and a "reviewer" agent can coexist in the same directory. Taking over an existing session (`sessionId`) keeps that session's original preset — to change persona, open a new session (same semantics as model). The deployment can lock it with `allowPresetOverride: false`; unknown preset ids are refused with the available list.
 
 `model_list`'s `source` names the catalog's origin: `sessionController` = the official view (same data source as the Web UI's model selector; includes `default`, `routableProviders`, per-provider load failures, and reasoning efforts); `llm` = fallback (`llm.listProviders()` + per-provider `listModels()`, for deployments without `sessionController`, e.g. headless, and without reasoning metadata). It also reports the plugin's own model config and `allowModelOverride`, so a caller can see at a glance whether it may choose.
 
@@ -90,9 +96,9 @@ Two source semantics worth knowing:
 
 When continuing the same `sessionId`, the executor already remembers prior turns — send only the **delta** in `context`.
 
-Every result is structured: `sessionId / model / assistantText / toolCalls / toolResults / changes / verification / leftovers` — ready to be persisted by the caller.
+Every result is structured: `sessionId / model / preset / durationMs / usage? / assistantText / toolCalls / toolResults / changes / verification / leftovers` — ready to be persisted by the caller. `durationMs` is the wall-clock turn duration; `usage` is opportunistically aggregated from the host's `TokenUsage` when present.
 
-Sessions are reused per `cwd + model` (LRU, default 8) to avoid reloading project context on every call.
+Sessions are reused per `cwd + model + preset` (LRU, default 8) to avoid reloading project context on every call.
 
 ## Typical workflows
 
@@ -125,9 +131,24 @@ Continue it later with `"sessionId": "<from the result>"` — send only the delt
 ```
 
 **4. Long synchronous runs** — `agent_run` supports MCP-native progress and cancellation: clients
-that pass `_meta.progressToken` receive `notifications/progress` heartbeats, and any client can
-cancel via the standard `notifications/cancelled` (both wired to the host agent's official
-`cancel`). No custom polling protocol required.
+that pass `_meta.progressToken` receive `notifications/progress` heartbeats (`agent running: turn N,
+last tool X, M new events`), and any client can cancel via the standard `notifications/cancelled`
+(both wired to the host agent's official `cancel`). No custom polling protocol required.
+
+**5. Real-time steering** — redirect a running agent instead of cancelling and re-running:
+
+```json
+{ "name": "agent_steer", "arguments": { "sessionId": "…", "message": "stop refactoring; just fix the test" } }
+{ "name": "agent_steer", "arguments": { "taskId": "…", "message": "the API changed, see docs/v2.md", "mode": "inject" } }
+```
+
+`steer` is consumed at the next step boundary of the current turn (the turn completes normally with
+a full structured result); `inject` adds model-facing context without waking the driver. Steering an
+idle session is refused with a pointer to `agent_run`.
+
+**6. Browse without spending tokens** — MCP resources mirror the read tools
+(`dsh://status`, `dsh://queue`, `dsh://sessions`, `dsh://sessions/{sessionId}/history`):
+`resources/list` + `resources/read` for clients that support them, same whitelist boundaries.
 
 ## Install & run
 
@@ -188,13 +209,16 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
         port: 8090
         host: 127.0.0.1        # localhost only by default; add auth before exposing
         # authToken: 'your-secret-token'   # Bearer token auth (constant-time compare)
-        # workspaceRoots: ['/workspace']   # cwd whitelist (separator/case-safe cross-platform)
+        # workspaceRoots: ['/workspace']   # cwd whitelist (separator/case-safe cross-platform; also gates session surfaces)
         # allowedHosts: ['my-box.lan']     # extra allowed Host header values (DNS-rebinding guard)
+        # queuePersistPath: '.dsh/queue.json'  # queue persistence (restored on restart)
+        # queuePersistKey: 'passphrase'    # persistence-file encryption passphrase (AES-256-GCM; unset = plaintext + startup warning)
         # preset: 'standard'               # agent preset to mount
         # model: ''                        # empty = follow dsh user/default settings
         # provider: ''                     # pair with model; empty = follow host default
         # reasoningEffort: ''              # default reasoning effort (empty = adapter default)
         # allowModelOverride: true         # false = pin the model, refuse caller overrides
+        # allowPresetOverride: true        # false = pin the preset, refuse caller overrides
         # sessionTtlMs: 86400000           # idle MCP transport sessions are reaped after this (0 = never)
 ```
 
@@ -202,21 +226,23 @@ Let **another dsh** operate this one (add to the peer profile's `cordis.patch.ym
 |---|---|---|
 | `host` / `port` | `127.0.0.1` / `8090` | MCP server bind address; a listen failure (port in use, …) fails plugin startup loudly |
 | `authToken` | — | Bearer token; enforced on every request when set (constant-time compare) |
-| `workspaceRoots` | — | cwd whitelist; agents may only work inside the listed directories (subdirs included) |
+| `workspaceRoots` | — | cwd whitelist; agents may only work inside the listed directories (subdirs included). Also gates the **session surfaces**: `sessionId` takeover and `session_list` / `session_history` only reach whitelisted sessions (see Security) |
 | `allowedHosts` | — | extra allowed Host-header values; the bind host and loopback aliases are always allowed, everything else gets 403 |
 | `provider` / `model` | follow host user settings (`agentDefaultModel`) | spawned-agent model selection; **configure as a pair** — a partial setting is completed from the host default |
 | `reasoningEffort` | adapter default | default reasoning effort (adapter-defined id, see `reasoningEfforts` in `model_list`) |
 | `allowModelOverride` | `true` | whether callers (`agent_run`/`task_inbox`/`select_model`) may override the model; `false` pins it and refuses overrides explicitly |
-| `preset` | `standard` | agent preset to mount |
+| `allowPresetOverride` | `true` | whether callers (`agent_run`/`task_inbox`) may pick a preset for new sessions; `false` pins the deployment's `preset` and refuses overrides explicitly |
+| `preset` | `standard` | agent preset to mount (the default/per-call fallback; per-call `preset` applies to newly created sessions only — taking over an existing session keeps its original preset) |
 | `defaultDetail` | `summary` | default detail level for `agent_run`/`task_result` (overridable per call via `detail`) |
 | `reattachOrphans` | `false` | bulk-attach ungrouped sessions to workspaces at startup (writes user data; the `attach_session` tool remains available anytime) |
 | `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 min / `8` | queue capacity, result TTL, session-pool LRU limit |
 | `taskTimeoutMs` | `0` (off) | auto-timeout per agent turn; on expiry the host's official `agent.cancel({kind:'hook'})` fires and the result's `error` notes the timeout. Raise it for long-task deployments |
 | `progressIntervalMs` | `5000` (min 250) | heartbeat interval for `notifications/progress` on `agent_run` — only active when the caller passes `_meta.progressToken` |
 | `queuePersistPath` | — (off) | persist the task queue to this file: every change is written, and on startup `done`/`error`/`cancelled` tasks come back with their results, `queued` tasks re-execute, and `running` tasks are honestly marked `interrupted by restart` |
+| `queuePersistKey` | — (plaintext + startup warning) | encryption passphrase for the persistence file (AES-256-GCM, `DSHQ1` header), so task payloads never sit on disk in plaintext. A wrong passphrase / corrupt file is tolerated (warning, queue starts empty); legacy plaintext files still read and migrate to ciphertext on the next write |
 | `sessionTtlMs` | `86400000` (24 h) | reap idle MCP transport sessions after this long; clients get 404 on the stale session id and re-initialize per the spec (`0` = never reap) |
 
-Every result is structured: `sessionId / model / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen. Empty `error`/`taskId` fields are omitted rather than sent as empty strings. Tool-level failures (unknown `taskId`, model override refused, service unavailable, cwd outside `workspaceRoots`, a turn that ended in error) come back as tool results **with `isError: true`** (the MCP-spec-recommended shape) — strict clients and models can recognize them without parsing the payload.
+Every result is structured: `sessionId / model / preset / durationMs / usage? / changes / verification / leftovers / error / toolCallCount …` (projected by `detail` level); `error` carries non-normal turn endings (model failure / cancel / blocked), so a silent empty "success" can no longer happen. Empty `error`/`taskId` fields are omitted rather than sent as empty strings. Tool-level failures (unknown `taskId`, model/preset override refused, service unavailable, cwd outside `workspaceRoots`, a turn that ended in error) come back as tool results **with `isError: true`** (the MCP-spec-recommended shape) — strict clients and models can recognize them without parsing the payload. `model_list` / `task_list` / `session_list` additionally declare an MCP **`outputSchema`** (derived from a zod definition, advertised via tools/list) and return `structuredContent` alongside an identical text mirror — strongly-typed clients get parsed results for free.
 
 ## Zero host copies
 
@@ -243,8 +269,27 @@ non-browser MCP clients that send no Origin are unaffected), a `/mcp`-only HTTP 
 else 404), `401` answers with a `WWW-Authenticate: Bearer` challenge, and idle transport sessions
 are reaped after `sessionTtlMs` (24 h default). Tools also carry spec-metadata (`title`,
 `annotations.readOnlyHint` etc., the 2025-06-18 protocol fields) so clients can label and
-sandbox-check them. Note: `queuePersistPath` writes task payloads (task text, caller context,
-results) to a plaintext file — point it at a location with appropriate filesystem permissions.
+sandbox-check them.
+
+**The `workspaceRoots` boundary covers execution and content reads**: the `cwd` argument
+(`agent_run` / `task_inbox`, validated at submit time), `sessionId` takeover at all three tiers
+(pool / live / persisted resume — each tier checks the session's own cwd), real-time intervention
+(`agent_steer` refuses out-of-whitelist sessions), and the read surfaces — tools
+(`session_list` lists whitelisted sessions only; an out-of-whitelist `cwd` argument is refused;
+`session_history` cannot read out-of-whitelist sessions) and the MCP resources
+(`dsh://sessions` / `dsh://sessions/{id}/history` share the same implementation and boundary).
+Metadata operations
+(`select_model` / `rename_session` / `attach_session`) remain reachable by `sessionId`
+(they touch neither execution nor content). Without `workspaceRoots`, none of this applies.
+
+**Tool approval inside spawned sessions**: spawned sessions follow the host / preset approval
+policy — this plugin drives them through MCP with **nobody at the keyboard**, so under `ask`-style
+policies sensitive operations may pop a dialog or fail closed. Verify how sensitive operations
+behave under your actual preset before deploying, or pick an unattended-friendly preset/policy.
+
+Note: `queuePersistPath` writes task payloads (task text, caller context, results) to a file —
+plaintext by default (a warning is logged at startup); with `queuePersistKey` set it is
+AES-256-GCM ciphertext. Either way, point it at a location with appropriate filesystem permissions.
 
 ## Web settings panel
 
@@ -272,7 +317,8 @@ The initial source of this project was **copied from** [`chushixixin/dsh-harness
 
 The 0.2.0 compatibility issues were fixed in 0.3.0; **0.3.1 completed live-host E2E verification** (all green — see [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)) and fixed what it uncovered: the `{{model}}` prompt variable (model selection now completed via `agentDefaultModel`), turn-failure surfacing, pool-session flush, startup reattach off by default, and corrected install docs.
 **0.5.0 completed the model-selection surface**: `model_list` (official catalog / `llm` fallback), per-call overrides on `agent_run` + `task_inbox`, `select_model` (in-session switch), `reasoningEffort`, the `allowModelOverride` gate, `model` reported in every result, and a session pool keyed by `cwd + model`.
-**The current (unreleased) batch is a large consolidated update** covering six areas, developed in internal milestones (see the CHANGELOG for the per-milestone detail):
+**Latest (unreleased) batch**: `agent_steer` (real-time steering/injection on running agents, by `sessionId` or running `taskId`; idle sessions refuse steer), per-call `preset` (pool keyed by `cwd + model + preset`, `allowPresetOverride` gate), richer progress heartbeats (turn count + last tool) and results (`durationMs`, opportunistic `usage`), `dsh_status` + `workspace_list` tools, and an MCP resources surface (`dsh://status`, `dsh://queue`, `dsh://sessions`, per-session history) sharing the tools' whitelist boundaries. See the CHANGELOG (批次 18) for detail.
+**The previous (unreleased) batch was a large consolidated update** covering six areas, developed in internal milestones (see the CHANGELOG for the per-milestone detail):
 
 - **Protocol conformance**: tool errors carry `isError: true`, Origin-header check + `WWW-Authenticate` challenge join the DNS-rebinding guards, tools expose `title` + `annotations`, transport sessions are reaped (`sessionTtlMs`), 10 MB request-body cap;
 - **Cancellation**: `agent_run` honours MCP `notifications/cancelled` and client timeouts (both wired to the host's official `agent.cancel`);
@@ -287,9 +333,9 @@ What remains:
 - [x] ~~No server-side timeout for `agent_run` / `task_inbox`~~ — the opt-in `taskTimeoutMs` (off by default) fires the host's official cancel; callers can also cancel actively (`notifications/cancelled` for `agent_run`, `task_cancel` for queue tasks).
 - [x] ~~The queue cannot be listed or cancelled either~~ — done (`task_list` / `task_cancel`).
 - [x] ~~Read-only query surface is still incomplete~~ — `session_list` + `session_history` (live sessions) join `attach_session` / `rename_session` / `select_model`; reading the full log of persisted-only sessions needs a host-side load API.
-- [ ] `preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call.
-- [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected).
-- [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle).
+- [x] ~~`preset` remains deployment-level (one persona per MCP server instance); it cannot be chosen per call~~ — per-call `preset` on `agent_run` / `task_inbox` for newly created sessions (pool keyed by `cwd + model + preset`, `allowPresetOverride` gate); taking over an existing session keeps its original preset.
+- [ ] Tool calls inside spawned sessions go through the host approval policy (sensitive operations under `ask` may pop a dialog or fail closed; the read-only E2E operation was unaffected). The boundary is documented in the Security section; live verification depends on E2E.
+- [ ] `dsh_list_tools` only lists the host-global registry; listing an agent's actually-visible tools needs a host-side API (the ScopeKey is a private symbol, unreachable under the zero-copy principle). The tool now ships this blind-spot note alongside the data (`note` field).
 - [ ] `select_model` requires the web profile's `sessionController`; where that service is absent (e.g. headless) only the catalog fallback and per-call overrides work, and the tool says so explicitly.
 - [ ] Protocol-native task augmentation (2025-11-25 draft, SDK marks the interfaces experimental): `agent_run` as a spec-native task with `tasks/get` / `tasks/result` polling. Deliberately deferred — our `task_inbox` / `task_result` / `task_cancel` already cover the workflow for all clients; revisit when the spec leaves draft.
 - [ ] When dsh releases new versions, the `@deepseek-ai/*` devDependencies need syncing (compile-time only; the zero-runtime-dependency design is unaffected).
@@ -299,13 +345,18 @@ What remains:
 ```bash
 npm install
 npm run build    # standalone build (plain tsc) -> lib/
-npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085 (132 checks, real MCP protocol round-trips incl. official SDK client)
+npm run typecheck  # type-check the TS test files (no emit)
+npm run smoke    # fake-ctx smoke on ports 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085/8083/8082 (190 checks, real MCP protocol round-trips incl. official SDK client; fake host lives in smoke-harness.ts)
                  # + a port-conflict case (apply must fail loudly)
 ```
 
+Tests are plain TypeScript run directly with `node smoke.ts` (native type stripping) — requires Node ≥ 23.6 for dev scripts only; the shipped plugin itself runs on Node ≥ 18.
+
+The source is split by responsibility (`config`/`state`/`paths`/`persist`/`projection`/`host`/`engine`/`tools`/`onboarding`, with `index.ts` as assembly only) — see [docs/architecture.zh.md](./docs/architecture.zh.md) for the module map and design constraints.
+
 Live-host E2E (needs a local dsh with model credentials; costs a few tokens): boot a dedicated
 profile as described in [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md), then run
-`E2E_WITH_AGENT=1 node e2e.mjs`.
+`E2E_WITH_AGENT=1 node e2e.ts`.
 
 ## License
 

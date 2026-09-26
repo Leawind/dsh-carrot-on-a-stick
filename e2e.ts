@@ -5,7 +5,7 @@
 // mounting (toolCalls non-empty), local userMessage() acceptance, snapshotEvents
 // extraction, and the summary contract on a live agent-loop.
 //
-// Usage: E2E_MCP_URL=http://127.0.0.1:8090/mcp [E2E_WITH_AGENT=1] node e2e.mjs
+// Usage: E2E_MCP_URL=http://127.0.0.1:8090/mcp [E2E_WITH_AGENT=1] node e2e.ts
 // E2E_MODEL_LIST=0 skips the read-only model_list leg (it asks the host's model
 // adapters for their catalogs, so it can be slow on a cold adapter).
 const BASE = process.env.E2E_MCP_URL ?? 'http://127.0.0.1:8090/mcp'
@@ -61,21 +61,34 @@ try {
     jsonrpc: '2.0', id: 1, method: 'initialize',
     params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'e2e', version: '1.0' } },
   })
-  report('initialize(MCP 握手)', init.status === 200 && Boolean(init.sid), `server=${parsePayload(init.text).result?.serverInfo?.name ?? '?'}`)
+  const initPayload = init.status === 200 ? parsePayload(init.text).result : undefined
+  report('initialize(MCP 握手)', init.status === 200 && Boolean(init.sid), `server=${initPayload?.serverInfo?.name ?? '?'}`)
+  report('initialize 携带 server instructions(工作流引导)', typeof initPayload?.instructions === 'string'
+    && initPayload.instructions.length > 200 && initPayload.instructions.includes('dsh_get_started'),
+    `${typeof initPayload?.instructions === 'string' ? initPayload.instructions.length : 0} chars`)
   const sid = init.sid
   await rpc(sid, { jsonrpc: '2.0', method: 'notifications/initialized' })
 
   const toolsList = await rpc(sid, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
   const names = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
-  const expected = ['echo', 'dsh_list_tools', 'model_list', 'agent_run', 'task_inbox', 'task_result', 'task_list', 'task_cancel', 'session_list', 'session_history', 'select_model', 'attach_session', 'rename_session']
-  report('tools/list 十三工具齐(含 model_list/select_model/task_*/session_*)', expected.every((n) => names.includes(n)), names.join(','))
+  const expected = ['echo', 'dsh_list_tools', 'dsh_status', 'workspace_list', 'model_list', 'agent_run', 'agent_steer', 'task_inbox', 'task_result', 'task_list', 'task_cancel', 'session_list', 'session_history', 'select_model', 'attach_session', 'rename_session', 'dsh_get_started']
+  report('tools/list 十七工具齐(含 dsh_status/agent_steer/dsh_get_started)', expected.every((n) => names.includes(n)), names.join(','))
+
+  const guide = await rpc(sid, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'dsh_get_started', arguments: { section: 'errors' } } })
+  const guideText = guide.status === 200 ? (parsePayload(guide.text).result?.content?.[0]?.text ?? '') : ''
+  report('dsh_get_started(section=errors) 返回替代路径对照', guideText.includes('Error → alternative path') && guideText.includes('agent_run'),
+    `${guideText.length} chars`)
 
   const echo = await rpc(sid, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'e2e-ping' } } })
   report('echo 往返', echo.status === 200 && echo.text.includes('e2e-ping'))
 
   const listTools = await rpc(sid, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'dsh_list_tools', arguments: {} } })
   const lt = innerOf(listTools)
-  report('dsh_list_tools 返回数组', Array.isArray(lt), Array.isArray(lt) ? `${lt.length} 个全局工具: ${lt.slice(0, 8).map((t) => t.name).join(',')}${lt.length > 8 ? '…' : ''}` : String(lt.error).slice(0, 120))
+  report('dsh_list_tools 返回全局注册表(source/note/tools)', lt?.source === 'global-registry'
+    && typeof lt?.note === 'string' && Array.isArray(lt?.tools),
+    Array.isArray(lt?.tools)
+      ? `${lt.tools.length} 个全局工具: ${lt.tools.slice(0, 8).map((t) => t.name).join(',')}${lt.tools.length > 8 ? '…' : ''}; note=${String(lt.note).slice(0, 60)}`
+      : String(lt.error).slice(0, 120))
 
   // ── model_list(只读): 真机模型目录 ──
   if (process.env.E2E_MODEL_LIST !== '0') {
@@ -143,13 +156,15 @@ try {
         task: '用一条命令列出当前目录下的文件名(只要文件名, 不要内容), 然后输出总结。',
         cwd: CWD,
         title: 'dsh-carrot-on-a-stick e2e',
+        // 本探针要验证 preset 挂载(toolCalls 原文)与事件提取, 必须用 full 档
+        detail: 'full',
       },
       _meta: { progressToken: 'pt-e2e' },
     },
   })
   // agent_run 可能跑几十秒: rpc() 返回的 text 是完整 SSE 体, 进度心跳行就在其中, 最后统一解析
-  const timer = new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), AGENT_TIMEOUT_MS))
-  const run = await Promise.race([runPromise, timer])
+  const timer = new Promise<{ timeout: boolean }>((resolve) => setTimeout(() => resolve({ timeout: true }), AGENT_TIMEOUT_MS))
+  const run: any = await Promise.race([runPromise, timer])
   if (run.timeout) {
     report('agent_run 在限时内返回', false, `TIMEOUT after ${AGENT_TIMEOUT_MS}ms(可能卡在审批或模型路由)`)
     finish()

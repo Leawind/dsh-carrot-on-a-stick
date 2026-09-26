@@ -2,9 +2,9 @@
 import net from 'node:net'
 import { apply } from './lib/index.js'
 
-const ctx = {
+// 假 ctx 不是真 cordis(webServer 类可选依赖不出现), 假宿主边界不做结构校验
+const ctx: any = {
   effect: (fn) => fn(),
-  // 依赖注入桩: 假 ctx 不是真 cordis(webServer 类可选依赖不出现)
   inject: () => undefined,
   get: () => undefined,
 }

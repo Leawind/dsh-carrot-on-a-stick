@@ -5,6 +5,157 @@
 > 0.5.0 之后的全部工作（尚未发布）。以下按开发批次（先后顺序）组织，
 > **时间倒序**排列（批次 1 的完整条目在本节末尾）。
 
+### 批次 21: 结构化输出(outputSchema) + CI node 矩阵修复 + 内层 agent 执行合同
+
+- **list 类工具带 `outputSchema` / `structuredContent`**（MCP 2025-06-18 结构化输出）：
+  `model_list` / `task_list` / `session_list` 用 zod 定义输出 schema 一份——tools/list 下发的
+  JSON Schema 与返回值校验都由它派生（SDK 内部转换 + 校验），不手写 JSON Schema、零新增依赖。
+  成功结果 text 镜像与 structuredContent 同源同值（先 `schema.parse` 再回，实现与 schema 漂移
+  当场炸出）；isError 结果按 SDK 约定跳过校验。MCP 规范要求 structuredContent 是对象——
+  `task_list` 的数组与 `dsh://queue` 资源同步包成 `{ tasks: [...] }`。
+- **内层 agent 执行合同**（`engine.ts` fullTask）：补一句"你在无人监督的受控环境里执行，
+  总结会被机器读取、转交给看不到本次对话的调用方——总结必须自包含、验证具体到命令/文件"，
+  提升 `task_result` summary 的稳定性。
+- **CI 修复**：测试脚本改为 `node *.ts` 直跑后（Node 23.6+ 才默认开启原生 type stripping），
+  `ci.yml` 的 node 22 矩阵项必挂——矩阵改为 node 24/26；CI 同时补上 `npm run typecheck`
+  （此前测试文件的类型检查只在本地跑）。
+- smoke 新增 2 项结构性断言（tools/list 携带 outputSchema；structuredContent 与 text 同源），
+  task_list 相关断言适配 `{ tasks }` 包装；`innerOf` 优先取 SDK 校验过的 structuredContent。
+
+### 批次 20: 帮助文档分节 + dsh://guide 资源 + e2e 探针补齐 + 测试 TS 化
+
+- **`dsh_get_started` 加 `section` 参数**（`concepts`/`workflows`/`errors`/`results`/`limits`，
+  缺省 `all` 整份）：`src/onboarding.ts` 按节拆分为 `GET_STARTED_SECTIONS`，纠错场景（如只想查
+  错误→替代路径表）不必把整份文档灌进调用方上下文——detail 分级的 token 经济思路延伸到认知面。
+- **新资源 `dsh://guide`**（resources 面 4 → 5 个）：帮助文档进 `resources/read`，与"资源与工具
+  同数据"的惯例一致；工具 `section=all` 同数据。
+- **e2e 真机探针补齐**：initialize 结果携带非空 `instructions`（含 dsh_get_started 指路）、
+  `dsh_get_started(section=errors)` 返回对照表、工具清单断言从陈旧的 13 个更新到 17 个。
+- **测试文件 mjs → ts**：`smoke` / `smoke-harness` / `smoke-port` / `e2e` / `dump-session` 全部
+  改为 TypeScript，`node smoke.ts` 直跑（Node 原生 type stripping，开发脚本需 Node ≥ 23.6；
+  发布产物仍支持 Node ≥ 18）。新增 `tsconfig.test.json`（noEmit + allowImportingTsExtensions，
+  假宿主边界允许 any）与 `npm run typecheck`；`npm run smoke` 改跑 `.ts`。此前留 .mjs 的原因
+  （不经构建直跑编译产物）与 TS 不冲突：测试仍 `import './lib/*.js'`，验证的依然是构建产物。
+
+### 批次 19: agent 认知面——server instructions + `dsh_get_started` 帮助文档
+
+此前"让 agent 了解 dsh"只覆盖到单工具调用粒度（描述/参数 describe/错误信息替代路径），
+整体工作流与概念词典只存在于 README，到不了协议对面的模型侧。本批次把认知内容做进协议：
+
+- **server `instructions`**（新文件 `src/onboarding.ts`，`SERVER_INSTRUCTIONS`）：MCP 规范的
+  `serverOptions.instructions` 随 initialize result 下发——几十行的英文快速引导：心智模型
+  （commander/executor）、model_list → agent_run(sessionId 续接) → task_inbox/task_result 轮询 →
+  agent_steer 干预的工作流主线、结构化结果与 isError 约定，末尾指路 `dsh_get_started`。
+- **新工具 `dsh_get_started`**（只读，静态返回 `GET_STARTED_DOC`）：dsh 概念词典（live/常驻池/
+  持久化三级接管、preset 仅对新建会话生效、池按 cwd+模型+preset 分桶、turn vs step、审批策略对
+  无人值守的影响）、六条工作流食谱、错误→替代路径对照表（空闲 steer→agent_run、persisted-only
+  →sessionId 续接、sessionController 缺席→provider/model、白名单/队列满等）、detail 分级省上下文
+  说明、部署方配置约束（workspaceRoots/allowModelOverride/allowPresetOverride/maxQueue）。
+- `agent_steer` / `attach_session` 描述末尾追加"dsh 概念见 dsh_get_started"交叉引用。
+- 同步：README / README.zh-CN 工具表加行（16 → 17 个）、architecture.zh.md 模块清单修正
+  （tools.ts 计数 13 → 17，补 onboarding 模块行）、smoke 新增"initialize 携带 instructions"检查、
+  工具数断言 16 → 17（raw 与 SDK Client 两处）。
+
+### 批次 18: agent_steer 实时干预 + per-call preset + 观测增强 + MCP 资源面
+
+**实时干预：新工具 `agent_steer`**——对运行中的 agent 中途转向或注入上下文，无需取消重跑：
+
+- `mode=steer`（默认）：转向指令走宿主 `Agent.steer()`，在下个 step 边界被当前 turn 消化；
+  `mode=inject`：走 `Agent.inject()` 注入模型可见的补充上下文，不唤醒驱动（空闲时挂起到下次
+  唤醒，note 说明"可能错过已 claim pre-step 的请求"）。两者都是注入 handle 上的方法，零宿主副本。
+- 目标二选一：`sessionId`（常驻池 / live）或 `taskId`（执行中的队列任务）。为后者新增
+  `executeTask` 的 `onSession` 回调——拿到会话即回填 `item.sessionId`（此前池新建的会话 id
+  要到任务结束才回填，运行中无法按 taskId 定位）；新导出 `resolveLiveAgent`（池 → live 两级
+  查找，不做持久化 resume——重建出的驱动不是调用方正在看的那个）。
+- **空闲会话拒绝 steer**（`isError` + 提示改用 agent_run）：宿主语义下空闲 agent 收到 steer
+  会立刻开一个无人接管的 turn（结果不被回收成结构化结果），还可能与锁上排队的任务竞态；
+  inject 不受此限。白名单模式与执行面同边界（越界会话不可转向）。
+
+**per-call preset**：`agent_run` / `task_inbox` 新增 `preset` 参数，为**新建会话**选人格——
+池 key 从 `cwd + 模型三元组` 扩为 `+ preset`（同目录不同人格各自常驻会话）；接管已有会话
+（sessionId）沿用其创建时的 preset（想换人格就开新会话，与模型同语义）。校验：新配置
+`allowPresetOverride`（默认 true，与 allowModelOverride 对称）+ `ctx.agentPresets.list()`
+roster 存在性（报错带可用清单；list 不可用时透传给 mount 由宿主报错）。结果新增 `preset`
+字段（接管 live 会话无从得知时省略）。
+
+**观测增强**：
+
+- 进度心跳从"新增事件数"升级为 turn 摘要：`agent running: turn N, last tool X, M new events`
+  （turn/start 计数 + 最近 tool/call 名，调用方不看历史就知道它卡在哪）。
+- `TaskResult` 新增 `durationMs`（followup 投递 → whenIdle 收敛的墙钟时长）与机会式聚合的
+  `usage`（assistant/message 事件带 TokenUsage 形状的 usage 时聚合 input/output/total，
+  宿主未提供时省略字段）。
+
+**工具面 13 → 16**：新工具 `dsh_status`（部署状态快照：版本/监听/uptime/配置摘要/队列计数/
+常驻会话数/连接；apply 级完整快照经 `ToolDeps.statusSnapshot` 注入，缺省退回 state 级基础
+快照——headless/脚本场景不开 Web 面板也能看）与 `workspace_list`（workspaceRegistry 花名册）。
+
+**MCP resources 面**：`registerResources` 挂四个只读资源——`dsh://status`、`dsh://queue`、
+`dsh://sessions`、`dsh://sessions/{sessionId}/history`（ResourceTemplate，list 枚举可见会话）。
+`task_list` / `session_list` / `session_history` 的 handler 重构为共享实现
+（`listTasksPayload` / `collectSessions` / `sessionHistoryPayload`），工具与资源同数据同白名单
+边界，行为零变化。
+
+冒烟测试 → **185 项**（agent_steer 9 项：运行中转向/空闲拒绝/inject 挂起/持久化-only/参数
+校验/taskId 转向/白名单；preset 7 项；心跳/usage/duration 3 项；dsh_status/workspace_list
+3 项；resources 7 项含白名单；工具计数与 SDK Client 断言同步）。
+
+### 批次 17: 模块化架构 + 测试桩分离 + 持久化竞态修复
+
+**修复：停机时滞后的持久化写入会用空队列覆盖文件，重启丢整个队列**——`persistQueue` 原先在
+写入执行时才序列化队列；落盘链积压时，dispose（清空内存队列）之后才执行的迟到写入会把 `[]`
+写进持久化文件，下次启动恢复 0 项且无任何告警。现在快照在**调用瞬间**取（"持久化此刻的队列"），
+末次调用的快照必然是最新状态。冒烟压测（Phase G/X 重启路径，30+ 轮）抓到并回归验证。
+
+**src/index.ts（约 2280 行）按职责拆为 10 个模块**，依赖自上而下无环，行为零变化：
+
+- `config` 配置与默认值 / `types` 共享纯数据类型 / `state` 进程内可变状态单例(池/锁/队列/hooks)
+  / `paths` cwd 规范化与白名单(安全边界) / `persist` 持久化加密(纯函数) / `projection`
+  结果投影(纯函数) / `host` 零宿主副本桥接 + 工作区归组/会话查找 / `engine` 执行引擎
+  (模型解析/会话池/三级接管/取消/进度) / `tools` 13 个工具与模型目录 / `index` 只剩装配
+  (apply + HTTP 传输层 + GUI 控制面)。
+- 可变状态集中到 `state.ts` 一处:apply 经 `state.config = …` / `state.hooks.runTaskItem = …`
+  整体替换(ESM 导入绑定不可赋值,重建语义也更符合"热重载不跨次泄漏"),并用显式
+  `RuntimeState` 类型替代 `as` 断言;`engine.getAgent` 的三级接管抽为独立函数
+  `takeoverSession`(最高复杂度函数一屏可读)。
+- 纯函数下沉到 paths/persist/projection(无状态、可独立理解);新增
+  [docs/architecture.zh.md](./docs/architecture.zh.md)(模块地图、三条贯穿性设计约束、
+  关键流程速查、测试布局与验收线)。
+- **测试桩分离**:smoke.mjs(约 1350 行)的假宿主(桩服务/桩 agent/可观测记录)与 RPC 小工具
+  抽到 `smoke-harness.mjs`,本文件只留各 Phase 的行为断言——重构前后断言名集合逐一比对一致。
+- **时序加固**:全部"固定 sleep + 一次性断言"改为确定性等待/轮询——agent_run 取消链等 slow agent
+  收到 followup 才发 cancelled(必然命中官方 cancel)、LRU 淘汰等活跃标记落地、Phase G 重启恢复/
+  重执行轮询且"快照收敛"本身成为断言、心跳窗口放宽(1.5s→3s)、SDK Client 超时取消断言改为
+  基线递增——消除高负载(紧贴构建/CI 慢机)下的偶发失真;冒烟汇总行自带项数
+  (`SMOKE PASS (156 项)`),文档数字可自验。冒烟测试 → **156 项**(新增 `title` 命名
+  路径断言与 Phase P 纯函数边界:`isWithin` 的相等/子目录/尾分隔符/兄弟前缀陷阱等
+  6 项钉死安全边界语义,`parseSummary` 的多候选/中文别名/空兜底 4 项)。
+- 附带:Web 面板持久化摘要区分"密文/明文";`extractTexts` 累积参数改名,消除对结果包装
+  函数 `out()` 的名字遮蔽;`npm run smoke` 也先构建再跑(直接冒烟不再有测到旧 `lib/` 的风险,
+  `test` 脚本随之去掉 pretest 避免双重构建);**e2e.mjs 同步两处失配**——`dsh_list_tools`
+  批次 16 的新返回形状(source/note/tools),agent 探针显式 `detail: 'full'`(toolCalls 原文
+  断言所需,默认 summary 档不含原文);补齐 `title` 命名路径的零覆盖冒烟断言。
+
+### 批次 16: 白名单覆盖会话面 + 持久化静态加密
+
+**安全收紧 + 静态加密**：
+
+- `workspaceRoots` 从"只看 cwd 参数"扩展为覆盖**会话面**：`sessionId` 三级接管（常驻池 / live /
+  持久化 resume，resume 在重建 agent **之前**校验）逐层校验会话自身 cwd，`session_list` 只列
+  白名单内会话、`cwd` 过滤参数越界直接 `isError` 拒绝，`session_history` 越界会话不可读——
+  此前"cwd 参数给白名单内目录 + `sessionId` 指向白名单外会话"是一条沙箱绕过路径。白名单未配置
+  时零行为变化；白名单根启动时也按 realpath 规范化（与被校验目录同一 canon）。`session_list`
+  的 `total` 语义改为**过滤后计数**；元数据操作（`select_model` / `rename_session` /
+  `attach_session`）仍按 `sessionId` 可达。
+- 队列持久化可选**静态加密**：新配置 `queuePersistKey`（AES-256-GCM，口令 scrypt 派生、每次
+  写盘随机 salt/iv，文件头 magic `DSHQ1`，原子写保留）。未配置时明文落盘 + 启动告警；配置后
+  错口令/文件被改按损坏容忍（GCM auth 失败 → 告警，队列从空开始），旧版明文文件仍可读、下次
+  落盘自动迁移为密文。GUI status 快照新增 `queuePersistEncrypted`。
+- `dsh_list_tools` 返回从裸数组改为 `{ source, note, tools }`：盲区自述（"preset/agent 作用域
+  工具不可见，以 agent_run 的 toolCalls 为准"）随数据一起返回，不再只藏在工具描述里。
+- 冒烟测试 131 → 144 项（新增白名单会话面 8 项、持久化加密 5 项；`dsh_list_tools` 形状与
+  `session_list` total 断言随新语义更新）。
+
 ### 批次 15: session_list cwd 过滤
 
 **`session_list` 支持 cwd 过滤**：传 `cwd` 参数只列该目录（含子目录，realpath 归一化比对）

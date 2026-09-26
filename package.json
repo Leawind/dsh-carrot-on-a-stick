@@ -24,8 +24,8 @@
   "scripts": {
     "build": "tsc -p .",
     "dev": "tsc -p . --watch",
-    "smoke": "node smoke.mjs && node smoke-port.mjs",
-    "pretest": "npm run build",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "smoke": "npm run build && node smoke.ts && node smoke-port.ts",
     "test": "npm run smoke",
     "prepublishOnly": "npm run build"
   },

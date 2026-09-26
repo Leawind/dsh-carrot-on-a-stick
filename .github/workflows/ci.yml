@@ -12,7 +12,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node: [22, 24]
+        # 测试脚本以 .ts 直跑(Node 23.6+ 原生类型剥离), 22 跑不了
+        node: [24, 26]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -21,4 +22,5 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
       - run: npm test
