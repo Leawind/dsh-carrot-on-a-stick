@@ -5,3 +5,140 @@ commit-msg.txt
 *.tgz
 smoke-run.log
 .smoke-queue*.json
+
+# ==== agent-gitignore (https://github.com/Leawind/agent-gitignore) ====
+# ============================================================================
+# agent-gitignore — .gitignore entries for AI coding harnesses
+# https://github.com/Leawind/agent-gitignore
+#
+# Files that AI coding harnesses drop into your workspace — and you probably
+# don't want to commit. Append the entries you need to your .gitignore, or
+# copy this file wholesale.
+#
+# Each entry is backed by official documentation. See the repository README
+# for per-harness details and evidence links.
+#
+# NOTE: Rule and config files such as AGENTS.md, CLAUDE.md, .cursor/rules/,
+# .agents/skills/ and .zcodeignore are designed to be committed. Do NOT
+# ignore them blindly — see the "Keep in version control" section of the README.
+# ============================================================================
+
+# ---- Aider -----------------------------------------------------------------
+# Official default: `--gitignore` is on by default, so aider writes `.aider*`
+# into .gitignore on first run (chat history, input history, tags cache, ...).
+.aider*
+# Prefer sharing Aider config with the team? Un-comment the lines below:
+# !.aider.conf.yml
+# !.aiderignore
+
+# ---- Augment Code ----------------------------------------------------------
+# Officially "Automatically added to .gitignore and should not be committed".
+.augment/settings.local.json
+
+# ---- Claude Code -----------------------------------------------------------
+# Personal settings and private agent memories; Claude Code adds
+# **/.claude/settings.local.json to your global git excludes automatically,
+# but only after it writes the file itself.
+**/.claude/settings.local.json
+.claude/agent-memory-local/
+CLAUDE.local.md
+
+# ---- CodeBuddy -------------------------------------------------------------
+# Officially labeled "Auto-added to .gitignore".
+.codebuddy/settings.local.json
+CODEBUDDY.local.md
+
+# ---- Crush -----------------------------------------------------------------
+# Runtime logs (./.crush/logs/crush.log); session state lives in the user
+# data directory outside the project.
+.crush/
+
+# ---- DeepSeek Harness ------------------------------------------------------
+# Additive local overlays, "deliberately not committed" per the official docs.
+AGENTS.local.md
+CLAUDE.local.md
+
+# ---- Devin Desktop (formerly Windsurf) -------------------------------------
+# Officially labeled "No (gitignored)"; personal overrides and local secrets.
+.devin/config.local.json
+.devin/mcp_config.local.json
+# AGENTS.local.md is already covered by the DeepSeek Harness entry above.
+
+# ---- Firebase Studio -------------------------------------------------------
+# Official .gitignore example from the Firebase Studio docs: personal Nix
+# overrides layered on top of .idx/dev.nix.
+.idx/dev.local.nix
+
+# ---- Goose -----------------------------------------------------------------
+# Project memories auto-written by the Memory Extension at .goose/memory/;
+# sessions live in the user data directory.
+.goose/
+
+# ---- Hermes Agent / Pi -----------------------------------------------------
+# Personal, per-directory override of AGENTS.md ("typically gitignored").
+AGENTS.override.md
+
+# ---- Kimi Code CLI ---------------------------------------------------------
+# Officially recommended: "we recommend adding .kimi-code/local.toml to your
+# project's .gitignore so it is not committed".
+.kimi-code/local.toml
+
+# ---- MiMo Code -------------------------------------------------------------
+# Local state ignored by the official MiMo-Code repository itself.
+.mimocode/cache/
+.mimocode/wiki/
+.mimocode/wikis/
+.mimo-worktrees/
+
+# ---- OpenCode --------------------------------------------------------------
+# Plan files written by plan mode, plus the plugin dependencies that
+# OpenCode auto-installs into .opencode/ once the directory exists.
+.opencode/plans/
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+
+# ---- Qoder -----------------------------------------------------------------
+# Officially "should be added to .gitignore", plus the isolated worktrees
+# created by the CLI's --worktree switch.
+.qoder/settings.local.json
+.qoder/worktrees/
+
+# ---- Qwen Code -------------------------------------------------------------
+# Auto-generated skills, the pending-skills staging area, and the
+# developer-local session identifier created by `qwen serve`.
+.qwen/skills/auto-skill-*/
+.qwen/skills/learned-skill-*/
+.qwen/pending-skills/
+.qwen-session
+
+# ---- Replit ----------------------------------------------------------------
+# Locally installed Agent skills outside version control.
+.local/
+
+# ---- Serena ----------------------------------------------------------------
+# Language-server cache and the local config override. Serena writes its own
+# .serena/.gitignore with these entries on first activation; these lines
+# protect you before that happens.
+.serena/cache/
+.serena/project.local.yml
+
+# ---- ZCode -----------------------------------------------------------------
+# Session data such as plan files. If you share workspace skills/commands
+# through .zcode/, ignore only .zcode/plans/ instead.
+.zcode/
+
+# ---- Case-by-case ----------------------------------------------------------
+# Not ignored by default: these files are designed to be committed, but they
+# can hold secrets or personal preferences. Ignore them if you keep that
+# content local, or switch to environment-variable references instead.
+# .mcp.json                    # Claude Code project MCP servers (use ${VAR} refs)
+# .cursor/mcp.json             # Cursor project MCP servers (use ${env:} refs)
+# .gemini/settings.json        # may contain personal settings
+# .devin/mcp_config.json       # shared MCP servers; strip secrets first
+# .codex/config.toml           # project-level Codex config
+# .iflow/settings.json         # may hold apiKey/baseUrl (iFlow CLI, discontinued)
+# .idx/mcp.json                # Firebase Studio MCP servers
+# .kiro/settings/mcp.json      # workspace MCP servers; use ${VAR} refs or keep local
+# .kilo/tui.json               # personal terminal-UI preferences
+# .kilo/tui.jsonc
