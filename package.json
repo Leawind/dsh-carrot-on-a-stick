@@ -18,7 +18,7 @@
     "client",
     "cordis.yml",
     "README.md",
-    "README.zh-CN.md",
+    "README.zh.md",
     "CHANGELOG.md"
   ],
   "scripts": {
