@@ -5,6 +5,7 @@ lib/
 commit-msg.txt
 *.tgz
 smoke-run.log
+gui-test-screenshots/
 
 # ==== agent-gitignore (https://github.com/Leawind/agent-gitignore) ====
 # ============================================================================

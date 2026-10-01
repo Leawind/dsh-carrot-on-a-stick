@@ -26,6 +26,7 @@
     "dev": "tsc -p . --watch",
     "typecheck": "tsc -p tsconfig.test.json",
     "smoke": "npm run build && node test/smoke.ts && node test/smoke-port.ts",
+    "smoke:ui": "node test/ui-harness.mjs",
     "test": "npm run smoke",
     "prepublishOnly": "npm run build"
   },
