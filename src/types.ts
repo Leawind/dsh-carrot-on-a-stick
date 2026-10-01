@@ -68,6 +68,8 @@ export interface TaskItem {
   reasoningEffort?: string
   /** 单次调用的 preset 覆盖(仅对新建会话生效; 接管已有会话沿用其原 preset) */
   preset?: string
+  /** 幂等键(调用方提供): 相同键的重复提交返回原任务不重复执行(响应丢失重试场景) */
+  idempotencyKey?: string
   status: 'queued' | 'running' | 'done' | 'error' | 'cancelled'
   /** 取消句柄: task_cancel 触发 abort → executeTask 走官方 agent.cancel */
   controller?: AbortController

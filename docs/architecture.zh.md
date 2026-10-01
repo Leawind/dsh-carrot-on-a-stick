@@ -74,16 +74,16 @@ host → {paths,config}; paths → state; state → {config,types}; projection �
 
 ## 测试布局
 
-- `smoke.ts`:190 项行为断言,按 Phase 组织(协议/安全/白名单/持久化/取消/进度/并发/LRU/GUI/
+- `test/smoke.ts`:190 项行为断言,按 Phase 组织(协议/安全/白名单/持久化/取消/进度/并发/LRU/GUI/
   agent 认知面/纯函数边界)。
-  假宿主(桩 Cordis 服务 + 桩 agent + 可观测记录数组)与真 HTTP 的 RPC 小工具在 `smoke-harness.ts`
+  假宿主(桩 Cordis 服务 + 桩 agent + 可观测记录数组)与真 HTTP 的 RPC 小工具在 `test/smoke-harness.ts`
   ——Phase 只写行为断言;时序敏感断言一律走 `waitFor`/轮询,不做一次性请求。
-- 测试是普通 TypeScript,`node smoke.ts` 直跑(Node 原生 type stripping,开发机需 Node ≥ 23.6;
+- 测试是普通 TypeScript,`node test/smoke.ts` 直跑(Node 原生 type stripping,开发机需 Node ≥ 23.6;
   发布产物 lib/ 仍支持 Node ≥ 18);`npm run typecheck` 对测试文件做类型检查(不产出,
   tsconfig.test.json,假宿主边界允许 any)。
-- `npm test` = 先 build 再跑(smoke + 端口冲突专项 `smoke-port.ts`)
+- `npm test` = 先 build 再跑(smoke + 端口冲突专项 `test/smoke-port.ts`)
   ——**测试永远验证当前源码,不是 lib/ 里的旧产物**。
-- `e2e.ts`:真机 E2E(需 dsh 宿主与凭证),零 token 探针 + 一次真实 agent_run。
+- `test/e2e.ts`:真机 E2E(需 dsh 宿主与凭证),零 token 探针 + 一次真实 agent_run。
 
 改代码的验收线:`npm run build && npm test` 全绿(或直接 `npm test`,它自身先构建);
 行为变化必须同步 smoke 断言、README(中英)与 CHANGELOG 批次。

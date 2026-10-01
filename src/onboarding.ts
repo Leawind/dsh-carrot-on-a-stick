@@ -11,8 +11,35 @@
  * 面向模型阅读, 英文为主(与 host 侧术语一致); 改内容时同步 README 与 smoke 断言。
  */
 
-/** 随 MCP initialize result 下发的 server 引导文本(McpServer 第二参 serverOptions.instructions) */
-export const SERVER_INSTRUCTIONS = `\
+/** 随 MCP initialize result 下发的 server 引导文本(McpServer 第二参 serverOptions.instructions)。
+ * resourceFirst 部署只读工具下线, 引导改指资源面; 两种形态经 serverInstructions() 选择。 */
+export function serverInstructions(resourceFirst: boolean): string {
+  if (resourceFirst) {
+    return `\
+dsh-carrot-on-a-stick: an MCP bridge into a running dsh (DeepSeek Harness) process.
+Your MCP client is the commander; dsh is the executor — every execution tool here spawns
+or drives a dsh agent that has a full toolset (bash, fs, web, ...) inside the host.
+
+This deployment is resource-first: all read data lives on MCP resources —
+dsh://status[/config|/stats|/connections], dsh://guide[/section], dsh://tools,
+dsh://models[/{provider}], dsh://presets, dsh://workspaces[/{id}], dsh://sessions[/{id}],
+dsh://sessions/{id}/history[/before], dsh://sessions/{id}/events[/after],
+dsh://sessions/{id}/activity, dsh://queue[/{taskId}], dsh://agents.
+Read them with resources/read; subscribe with resources/subscribe to get
+notifications/resources/updated (task completion on dsh://queue/{taskId} — no polling).
+
+Quick start:
+- Read dsh://models before picking a model; pass provider+model as a pair to agent_run/task_inbox.
+- agent_run runs a task synchronously and returns a uri-level result pointing at
+  dsh://sessions/{id}/history (pass detail=summary|normal|full to inline the payload).
+- For long or parallel work use task_inbox, then subscribe to dsh://queue/{taskId};
+  cancel with task_cancel if needed.
+- agent_steer redirects a running agent mid-turn; steering an idle session is refused.
+- Session/preset/model rosters: dsh://sessions, dsh://presets, dsh://models, dsh://agents.
+- New to dsh? Read the dsh://guide resource (concept glossary, workflow recipes,
+  error→alternative-path cheat sheet).`
+  }
+  return `\
 dsh-carrot-on-a-stick: an MCP bridge into a running dsh (DeepSeek Harness) process.
 Your MCP client is the commander; dsh is the executor — every execution tool here spawns
 or drives a dsh agent that has a full toolset (bash, fs, web, ...) inside the host.
@@ -22,7 +49,8 @@ Quick start:
 - agent_run runs a task synchronously and returns a structured result. Continue the same
   conversation later by passing the returned sessionId (send only the delta in context).
 - For long or parallel work use task_inbox (returns taskId), poll task_result with
-  detail=status, and cancel with task_cancel if needed.
+  detail=status, and cancel with task_cancel if needed — or subscribe to the returned
+  dsh://queue/{taskId} resource and get pushed a resources/updated on completion.
 - agent_steer redirects a running agent mid-turn; steering an idle session is refused (use agent_run).
 - session_list / session_history let you find and inspect sessions; select_model switches
   an existing session's model in place (history preserved).
@@ -32,7 +60,10 @@ Quick start:
 
 If you are new to dsh, call the dsh_get_started tool first: it holds the concept glossary
 (takeover tiers, presets, turn vs step, approval policy), workflow recipes, and an
-error→alternative-path cheat sheet.`
+error→alternative-path cheat sheet. MCP resources (dsh://status, dsh://presets,
+dsh://sessions/{id}/history, dsh://queue/{taskId}, ...) mirror the read tools and add
+subscription-based push updates.`
+}
 
 /** dsh_get_started 的节 id: all=整份文档, 其余各取一节(section 参数可选项须与此对齐) */
 export type GuideSection = 'all' | 'concepts' | 'workflows' | 'errors' | 'results' | 'limits'
@@ -75,8 +106,11 @@ export const GET_STARTED_SECTIONS: Record<Exclude<GuideSection, 'all'>, string> 
   *Steps* are the model rounds inside it. \`agent_steer\` (mode=steer) is consumed at the
   next step boundary of the current turn; \`select_model\` takes effect on the next step.
 - **Approval policy** — the host may be configured to ask for confirmation on certain
-  actions. In unattended deployments such prompts can fail closed; prefer tasks that do not
-  depend on interactive approvals, and treat an \`error\` in the result as the signal.
+  actions. Unattended runs cannot answer such prompts: when the host pauses for input,
+  the turn ends with reason \`blocked\`, which surfaces in the result \`error\` (queue tasks
+  end with status \`error\`). To proceed, arrange the approval host-side or relax the host
+  approval policy for unattended use, then continue the same conversation via \`agent_run\`
+  with that sessionId. Prefer tasks that do not depend on interactive approvals.
 `,
   workflows: `\
 ## Workflow recipes
@@ -85,7 +119,9 @@ export const GET_STARTED_SECTIONS: Record<Exclude<GuideSection, 'all'>, string> 
    \`sessionId\`; pass it back later to continue that conversation (send only the delta).
 2. **Fire-and-forget queue** — \`task_inbox\` → poll \`task_result\` with \`detail=status\`
    (never re-injects the payload) → fetch the summary once done; \`task_cancel\` to abort;
-   \`task_list\` for the overview.
+   \`task_list\` for the overview. Pass an \`idempotencyKey\` so a retry after a lost
+   response returns the original task instead of running the work twice. Completed
+   results stay fetchable for 24h (config \`taskTtlMs\`).
 3. **Long synchronous runs** — pass \`_meta.progressToken\` on \`agent_run\` to receive
    \`notifications/progress\` heartbeats; cancel via the standard \`notifications/cancelled\`.
 4. **Real-time steering** — \`agent_steer\` on a running sessionId/taskId: mode=steer
@@ -94,9 +130,13 @@ export const GET_STARTED_SECTIONS: Record<Exclude<GuideSection, 'all'>, string> 
    \`session_history\` for recent turns (pass \`roles\` to keep only the turn types you
    need, e.g. \`["assistant"]\` to skip tool noise), \`select_model\` to switch models in place,
    \`rename_session\` / \`attach_session\` for housekeeping.
-6. **Token-cheap browsing** — MCP resources mirror the read tools (\`dsh://status\`,
-   \`dsh://queue\`, \`dsh://sessions\`, \`dsh://sessions/{id}/history\`, \`dsh://guide\`) for
-   clients that support \`resources/read\`.
+6. **Token-cheap browsing / push updates** — MCP resources mirror every read tool and add
+   surfaces tools don't have: \`dsh://status[/config|/stats|/connections]\`, \`dsh://guide[/section]\`,
+   \`dsh://tools\`, \`dsh://models[/{provider}]\`, \`dsh://presets\`, \`dsh://workspaces[/{id}]\`,
+   \`dsh://sessions[/{id}[/history[/before]|/events[/after]|/activity]]\`, \`dsh://queue[/{taskId}]\`,
+   \`dsh://agents\`. Subscribe with \`resources/subscribe\`: task completions push
+   \`notifications/resources/updated\` on \`dsh://queue/{taskId}\` (no polling), and
+   \`dsh://sessions/{id}/activity\` streams what a running agent is doing right now.
 `,
   errors: `\
 ## Error → alternative path

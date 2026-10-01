@@ -48,7 +48,11 @@ export interface Config {
    * 生效: agent turn 期间按该间隔发 notifications/progress(内容为新增会话事件数)。
    */
   progressIntervalMs?: number
-  /** 已完成任务保留毫秒数(默认 10 分钟) */
+  /**
+   * 已完成任务保留毫秒数(默认 24 小时)。完成结果(含失败/取消)在保留期内可随时取回,
+   * 适合提交后隔一段时间再回来审核的场景; 超期后 task_result/资源面报 "task not found"。
+   * 需要跨进程重启也保留结果时, 搭配 queuePersistPath/queuePersistKey(见下)。
+   */
   taskTtlMs?: number
   /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
   maxAgents?: number
@@ -70,6 +74,8 @@ export interface Config {
    * 任务队列持久化文件(默认空 = 不持久化, 重启丢队列)。设置后每次队列变化即串行落盘,
    * apply 时恢复: done/error/cancelled 连结果一起回来, queued 重新执行, running 如实标记
    * 为 "interrupted by restart"(无法安全续跑半个 turn)。
+   * 无人值守/提交后隔天审核的部署建议启用(搭配 queuePersistKey 加密): 进程重启后
+   * 已完成结果与待办任务都还在。默认关闭是因为无 key 时任务载荷明文落盘(启动时有告警)。
    */
   queuePersistPath?: string
   /**
@@ -83,6 +89,14 @@ export interface Config {
   allowedHosts?: string[]
   /** 结果默认详略级别(默认 summary; 单次调用可用 detail 参数覆盖) */
   defaultDetail?: 'summary' | 'normal' | 'full'
+  /**
+   * 资源优先形态(默认 false)。true 时只读工具面下线(dsh_get_started/dsh_list_tools/dsh_status/
+   * model_list/workspace_list/task_list/task_result/session_list/session_history), 数据一律经 MCP
+   * resources 面读取(dsh://status|guide|tools|models|presets|workspaces|sessions|queue|agents 及各模板),
+   * agent_run 的默认 detail 变为 'uri'(只回引用)。面向确认支持 resources 的客户端/部署;
+   * 默认 false 时工具与资源并存, 对不知 resources 的客户端零行为变化。
+   */
+  resourceFirst?: boolean
   /**
    * 启动时存量捞回: 把现存未分组会话补挂到已注册工作区(默认 false)。
    * 0.1.5+ 的 workspaceRegistry 本身按 header.cwd 自动索引, 该操作只补充手动花名册——
@@ -104,7 +118,8 @@ export const DEFAULTS = {
   maxQueue: 100,
   taskTimeoutMs: 0,
   progressIntervalMs: 5000,
-  taskTtlMs: 10 * 60 * 1000,
+  // 完成结果默认保留 24 小时(提交后隔一段时间回来审核/游戏测试仍可取回; 原默认 10 分钟太短)
+  taskTtlMs: 24 * 60 * 60 * 1000,
   maxAgents: 8,
   sessionTtlMs: 24 * 60 * 60 * 1000,
   authToken: '',
@@ -112,6 +127,7 @@ export const DEFAULTS = {
   queuePersistPath: '',
   queuePersistKey: '',
   defaultDetail: 'summary' as 'summary' | 'normal' | 'full',
+  resourceFirst: false,
 }
 
 export type RuntimeConfig = typeof DEFAULTS

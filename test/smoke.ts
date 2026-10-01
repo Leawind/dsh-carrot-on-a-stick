@@ -15,7 +15,8 @@
 //      工具带 title+annotations(2025-06-18 字段)、401 带 WWW-Authenticate、
 //      Origin 白名单(跨域/null 拒, 同源放行)、404 体不再挪用 -32601、会话空闲 TTL GC
 //  10. 取消与可观测: agent_run 经 notifications/cancelled 取消(官方 agent.cancel)、
-//      task_cancel/task_list 队列观测、session_list/session_history 查询面
+//      task_cancel 排队即终态/执行中 cancelling→收敛后 cancelled、task_list 队列观测、
+//      session_list/session_history 查询面
 //  11. LRU 淘汰跳过活跃会话、并发压力、GUI 控制面路由(status/stop/start 同源门禁)
 //  12. workspaceRoots 覆盖会话面: sessionId 三级接管越界拒绝(池/live/resume)、
 //      session_list 只列白名单内(total=过滤后计数, cwd 参数越界拒绝)、session_history 越界不可读、
@@ -24,16 +25,24 @@
 //  14. agent_steer 实时干预: 运行中转向(step 边界)/空闲拒绝/inject 挂起/持久化-only 报错/
 //      sessionId/taskId 二选一/执行中任务按 taskId 转向/排队中拒绝
 //  15. per-call preset: 新建会话挂载指定 preset/池按 preset 分组/未知 preset 报错/接管忽略 preset/
-//      allowPresetOverride 门禁/task_inbox 的 preset
+//      resume 恢复会话原 preset(非部署默认)/allowPresetOverride 门禁/task_inbox 的 preset
 //  16. MCP resources 面: resources/list + resources/read(status/queue/sessions/history 模板/guide)
 //  17. agent 认知面: dsh_get_started 的 section 参数(只取一节) + dsh://guide 资源 + initialize instructions
+//  18. 执行桥接语义: 统一 cwd 锁(按目录/按会话入口同锁串行)+接管显式 cwd 一致性校验、
+//      队列 turn 失败任务终态标 error(状态轮询可见)、task_inbox 幂等键去重(含并发同键:
+//      查重+入队同步临界区, followup 计数为证)、初始化窗口取消(create 闸门复现 getAgent
+//      窗口: 投递前复查, 零 followup)、取消窗口期 cancelRequested 在工具面可见、
+//      取消监听生命周期(getEventListeners: 执行中恰 1 个/getAgent 抛错后不残留)
 // 假宿主桩(桩服务/桩 agent/可观测记录)与 RPC 小工具在 ./smoke-harness.ts; 本文件只保留各 Phase 的行为断言。
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { getEventListeners } from 'node:events'
+import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
-import { apply } from './lib/index.js'
-import { basicStatusSnapshot } from './lib/tools.js'
-import { isWithin } from './lib/paths.js'
-import { parseSummary } from './lib/projection.js'
+import { apply } from '../lib/index.js'
+import { basicStatusSnapshot } from '../lib/tools.js'
+import { isWithin } from '../lib/paths.js'
+import { parseSummary } from '../lib/projection.js'
+import { state as pluginState } from '../lib/state.js'
 import {
   attachedIds,
   BASE,
@@ -45,10 +54,12 @@ import {
   fakeSessionController,
   fakeSessionTitle,
   flushed,
+  followups,
   FAKE_CWD,
   innerOf,
   makeCtx,
   mounted,
+  openSse,
   parsePayload,
   PORT,
   rawRequest,
@@ -66,7 +77,7 @@ const ctx = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm, se
 
 try {
   // ── Phase B(主流程): 无认证、无白名单, 端口 8099; 存量捞回显式开启 ──
-  await apply(ctx, { port: PORT, host: '127.0.0.1', reattachOrphans: true })
+  await apply(ctx, { port: PORT, host: '127.0.0.1', reattachOrphans: true, progressIntervalMs: 300 })
   await new Promise((r) => setTimeout(r, 400))
 
   const init = await rpc(undefined, {
@@ -149,11 +160,19 @@ try {
     && resumed.some((r) => r.id === 'sess-persisted') && flushed.includes('sess-persisted') && disposed.includes('sess-persisted')
   checks['resume 也带完整模型选择(agentDefaultModel 补全)'] = resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.provider === 'p1'
     && resumed.find((r) => r.id === 'sess-persisted')?.agentOptions?.model === 'm1'
+  // resume 恢复会话原 preset(header.agentPreset = reviewer), 而不是把部署默认(standard)盖上去
+  checks['resume 恢复会话原 preset(非部署默认)'] = runPersistedInner.preset === 'reviewer' && mounted.includes('reviewer')
   // full 档保留原文(排查用)
   checks['detail=full 保留 toolCalls 原文'] = Array.isArray(runPersistedInner.toolCalls) && runPersistedInner.toolCalls[0]?.name === 'bash'
 
   const runUnknown = await rpc(init.sid, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-unknown' } } })
   checks['agent_run 未知会话明确报错'] = runUnknown.status === 200 && String(innerOf(runUnknown).error ?? '').includes('session not found for resume')
+
+  // 接管一致性: 显式 cwd 与会话实际目录不一致 → 拒(防"以为在 A 树、实际在 B 树执行"; 缺省 cwd 则沿用会话目录)
+  const mismatchDir = resolve(FAKE_CWD, 'nonexistent-mismatch')
+  const runMismatch = await rpc(init.sid, { jsonrpc: '2.0', id: 148, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'x', cwd: mismatchDir, sessionId: 'sess-live' } } })
+  checks['agent_run 接管: 显式 cwd 与会话目录不一致被拒'] = String(innerOf(runMismatch).error ?? '').includes('lives in')
+    && String(innerOf(runMismatch).error ?? '').includes('sess-live')
 
   // 失败透出: turn/end error 进 result.error(E2E 发现的静默空结果缺陷), 且整个结果带 isError 标记
   const runErr = await rpc(init.sid, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'boom', sessionId: 'sess-err' } } })
@@ -181,6 +200,59 @@ try {
   const missingTask = await rpc(init.sid, { jsonrpc: '2.0', id: 18, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: 'nope' } } })
   checks['错误结果带 isError 标记(task_result 未知 taskId)'] = parsePayload(missingTask.text).result?.isError === true
 
+  // 队列失败透出: turn 失败(result.error)的任务终态标 error(而非 done)——只轮询 status 的调用方也看得到失败
+  // (error 态的状态轮询走 isError, innerOf 返回原始 JSON 文本, 断言按文本匹配)
+  const inboxErr = await rpc(init.sid, { jsonrpc: '2.0', id: 19, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'boom queued', sessionId: 'sess-err' } } })
+  const inboxErrId = innerOf(inboxErr).taskId
+  let inboxErrStatus: any = {}
+  for (let i = 0; i < 50 && !String(inboxErrStatus.error ?? '').includes('"status":"error"'); i++) {
+    const er = await rpc(init.sid, { jsonrpc: '2.0', id: 190 + i, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: inboxErrId, detail: 'status' } } })
+    inboxErrStatus = er.status === 200 ? innerOf(er) : {}
+    if (!String(inboxErrStatus.error ?? '').includes('"status":"error"')) await new Promise((r) => setTimeout(r, 100))
+  }
+  checks['队列失败透出: turn 失败的任务终态标 error(状态轮询可见)'] = String(inboxErrStatus.error ?? '').includes('"status":"error"')
+    && String(inboxErrStatus.error ?? '').includes('AUTH')
+
+  // 幂等键: 相同 idempotencyKey 的重复提交返回原任务(响应丢失重试不重复执行)
+  // 探针用独立 cwd(独占池 key), "只新建一个会话"才能作为"只执行一次"的确定性证据
+  const dedupeCwd = resolve(FAKE_CWD, 'nonexistent-dedupe')
+  const createdBeforeDedupe = created.length
+  const dedupeA = innerOf(await rpc(init.sid, { jsonrpc: '2.0', id: 195, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'dedupe probe', cwd: dedupeCwd, idempotencyKey: 'smoke-dedupe-1' } } }))
+  const dedupeB = innerOf(await rpc(init.sid, { jsonrpc: '2.0', id: 196, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'dedupe probe retry', cwd: dedupeCwd, idempotencyKey: 'smoke-dedupe-1' } } }))
+  checks['task_inbox 幂等键: 重复提交返回原任务'] = dedupeB.taskId === dedupeA.taskId && dedupeB.deduplicated === true
+  let dedupeDone: any = {}
+  for (let i = 0; i < 50 && dedupeDone.status !== 'done'; i++) {
+    const dd = await rpc(init.sid, { jsonrpc: '2.0', id: 1970 + i, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: dedupeA.taskId, detail: 'status' } } })
+    dedupeDone = dd.status === 200 ? innerOf(dd) : {}
+    if (dedupeDone.status !== 'done') await new Promise((r) => setTimeout(r, 100))
+  }
+  const dedupeC = innerOf(await rpc(init.sid, { jsonrpc: '2.0', id: 198, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'dedupe probe after done', cwd: dedupeCwd, idempotencyKey: 'smoke-dedupe-1' } } }))
+  checks['task_inbox 幂等键: 终态任务同样去重并回报状态'] = dedupeC.taskId === dedupeA.taskId && dedupeC.status === 'done' && dedupeC.deduplicated === true
+  // 三次提交只执行一次: 仅 dedupeA 新建过一个会话
+  checks['task_inbox 幂等键: 重复提交不重复执行(仅一个新会话)'] = created.length === createdBeforeDedupe + 1
+  // 并发同键提交: 查重+容量+入队必须是同步临界区——两个请求同时到达也只入队一个。
+  // 执行次数以 followup 计数为证(不只看新建会话数)
+  const concCwd = resolve(FAKE_CWD, 'nonexistent-conc-dedupe')
+  const [conc1, conc2] = await Promise.all([
+    rpc(init.sid, { jsonrpc: '2.0', id: 250, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'conc A', cwd: concCwd, idempotencyKey: 'smoke-dedupe-conc' } } }),
+    rpc(init.sid, { jsonrpc: '2.0', id: 251, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'conc B', cwd: concCwd, idempotencyKey: 'smoke-dedupe-conc' } } }),
+  ])
+  const ci1 = innerOf(conc1)
+  const ci2 = innerOf(conc2)
+  checks['task_inbox 幂等键: 并发同键提交只产生一个任务'] = ci1.taskId === ci2.taskId
+    && (ci1.deduplicated === true || ci2.deduplicated === true)
+  let concDone: any = {}
+  for (let i = 0; i < 50 && concDone.status !== 'done'; i++) {
+    const cr = await rpc(init.sid, { jsonrpc: '2.0', id: 2520 + i, method: 'tools/call', params: { name: 'task_result', arguments: { taskId: ci1.taskId, detail: 'status' } } })
+    concDone = cr.status === 200 ? innerOf(cr) : {}
+    if (concDone.status !== 'done') await new Promise((r) => setTimeout(r, 100))
+  }
+  // 只入队一个 → 只建一个会话、只执行一次(followup 计数为证; 在执行收敛后断言消除入队/建会话的时序差)
+  const concSessions = created.filter((c) => c.cwd === concCwd)
+  checks['task_inbox 幂等键: 并发同键只执行一次(单会话, followup 恰 1 次)'] = concDone.status === 'done'
+    && concSessions.length === 1
+    && followups.filter((f) => f.id === concSessions[0]?.id).length === 1
+
   // 事件读取走 snapshotEvents + 结构化解析
   checks['结构化解析(toolCalls/changes/verification)'] = runPersistedInner.toolCalls?.length === 1
     && runPersistedInner.toolCalls[0].name === 'bash'
@@ -202,7 +274,8 @@ try {
   const missingDir = resolve(FAKE_CWD, 'nonexistent-xyz')
   const runMissingCwd = await rpc(init.sid, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', cwd: missingDir } } })
   const runMissingInner = runMissingCwd.status === 200 ? innerOf(runMissingCwd) : { error: 'bad' }
-  checks['目录不存在: realpath 回退 resolve 且不阻断'] = Boolean(runMissingInner.sessionId) && created[1]?.cwd === missingDir
+  checks['目录不存在: realpath 回退 resolve 且不阻断'] = Boolean(runMissingInner.sessionId)
+    && created.some((c) => c.cwd === missingDir)
 
   // title 命名: 新建池会话时传 title → 走 sessionTitle 服务 rename(此前零覆盖)
   const titledCwd = resolve(FAKE_CWD, 'nonexistent-titled')
@@ -379,6 +452,163 @@ try {
   checks['resources/read: dsh://guide(整份帮助文档)'] = resGuideInner?.mimeType === 'text/markdown'
     && String(resGuideInner?.text ?? '').includes('## Concepts') && String(resGuideInner?.text ?? '').includes('## Workflow recipes')
 
+  // ── Phase R: 资源面 v2 —— 全量 URI/读语义/annotations/completion/订阅推送 ──
+  const readRes = async (id: number, uri: string): Promise<{ error?: string; json?: any; mime?: string }> => {
+    const r = await rpc(init.sid, { jsonrpc: '2.0', id, method: 'resources/read', params: { uri } })
+    if (r.status !== 200) return { error: 'http ' + r.status }
+    const payload = parsePayload(r.text)
+    if (payload.error) return { error: String(payload.error.message ?? '') }
+    const c = payload.result?.contents?.[0]
+    return { mime: c?.mimeType, json: c?.text !== undefined ? JSON.parse(c.text) : undefined }
+  }
+  checks['initialize 声明 resources.listChanged+subscribe'] = initResult?.capabilities?.resources?.listChanged === true
+    && initResult?.capabilities?.resources?.subscribe === true
+  checks['resources/list: 静态资源全集(guide 分节/tools/models/presets/workspaces/agents/status 细分)'] = [
+    'dsh://guide/concepts', 'dsh://guide/workflows', 'dsh://guide/errors', 'dsh://guide/results', 'dsh://guide/limits',
+    'dsh://tools', 'dsh://models', 'dsh://presets', 'dsh://workspaces', 'dsh://agents',
+    'dsh://status/config', 'dsh://status/stats', 'dsh://status/connections',
+  ].every((u) => resUris.includes(u))
+  // 新数据能力: presets 花名册(agent_run 的 preset 参数此前无从查证)/常驻池明细
+  const rPresets = await readRes(300, 'dsh://presets')
+  checks['resources/read: dsh://presets(花名册投影 id/name/description)'] = rPresets.json?.total === 2
+    && rPresets.json?.presets?.[0]?.id === 'standard' && rPresets.json?.presets?.[0]?.name === 'Standard'
+    && rPresets.json?.presets?.[1]?.id === 'reviewer' && rPresets.json?.presets?.[1]?.name === undefined
+  const rAgents = await readRes(301, 'dsh://agents')
+  checks['resources/read: dsh://agents(池明细 sessionId/cwd/preset/model/activeTurn)'] = rAgents.json?.total >= 1
+    && rAgents.json?.agents?.some((a: any) => a.sessionId === created[0]?.id && a.cwd === FAKE_CWD
+      && a.preset === 'standard' && a.model?.provider === 'p1' && a.activeTurn === false)
+  const rModels = await readRes(302, 'dsh://models')
+  checks['resources/read: dsh://models(官方目录口径)'] = rModels.json?.source === 'sessionController' && rModels.json?.routableProviders?.length === 2
+  const rTools = await readRes(303, 'dsh://tools')
+  checks['resources/read: dsh://tools(宿主全局注册表 + 盲区自述)'] = rTools.json?.source === 'global-registry'
+    && rTools.json?.tools?.some((t: any) => t.name === 'bash')
+  const rCfg = await readRes(304, 'dsh://status/config')
+  const rStats = await readRes(305, 'dsh://status/stats')
+  const rConns = await readRes(306, 'dsh://status/connections')
+  checks['resources/read: dsh://status 三细分(config/stats/connections)'] = rCfg.json?.version === '0.1.0'
+    && rCfg.json?.config?.maxAgents === 8 && rStats.json?.listening === true && typeof rStats.json?.uptimeMs === 'number'
+    && Array.isArray(rConns.json?.connections) && rConns.json.connections.length >= 1
+  // guide/errors 是 markdown 文本资源(不走 JSON)
+  {
+    const raw = await rpc(init.sid, { jsonrpc: '2.0', id: 308, method: 'resources/read', params: { uri: 'dsh://guide/errors' } })
+    const txt = raw.status === 200 ? String(parsePayload(raw.text).result?.contents?.[0]?.text ?? '') : ''
+    checks['resources/read: dsh://guide/errors(分节 markdown)'] = txt.includes('Error → alternative path') && !txt.includes('## Concepts')
+  }
+  // 读语义: sessions/{id} 元数据 persisted-only 可读 + historyReadable 指路; history 只对 live 可读
+  const rMetaLive = await readRes(309, 'dsh://sessions/sess-live')
+  const rMetaPersisted = await readRes(310, 'dsh://sessions/sess-persisted')
+  checks['resources/read: dsh://sessions/{id}(元数据, persisted-only 也可读+historyReadable 指路)'] = rMetaLive.json?.sessionId === 'sess-live'
+    && rMetaLive.json?.historyReadable === true && rMetaPersisted.json?.sessionId === 'sess-persisted'
+    && rMetaPersisted.json?.historyReadable === false
+  const rHistPersisted = await readRes(311, 'dsh://sessions/sess-persisted/history')
+  checks['resources/read: persisted-only 的 history → -32602 且指路 agent_run'] = String(rHistPersisted.error ?? '').includes('not live')
+    && String(rHistPersisted.error ?? '').includes('agent_run')
+  // 事件流(JSONL)与游标续读(after=1 → 返回下标 >1 的事件, 共 total-2 条)
+  const rEvents = await readRes(312, 'dsh://sessions/sess-live/events')
+  const rEvents2 = await readRes(313, 'dsh://sessions/sess-live/events/1')
+  checks['resources/read: dsh://sessions/{id}/events(JSONL + after 游标)'] = Array.isArray(rEvents.json?.lines)
+    && rEvents.json.lines.length === rEvents.json.total && rEvents.json.total >= 1
+    && JSON.parse(rEvents.json.lines[0]).type === 'user/message'
+    && rEvents2.json?.after === 1 && rEvents2.json?.returned === rEvents.json.total - 2 && rEvents2.json?.truncated === false
+  // 活动窗口(订阅推送的数据本体; assistantTail 取最后一条 assistant 文本)
+  const rActivity = await readRes(314, 'dsh://sessions/sess-live/activity')
+  checks['resources/read: dsh://sessions/{id}/activity(空闲态快照)'] = rActivity.json?.sessionId === 'sess-live'
+    && rActivity.json?.active === false && rActivity.json?.turns >= 1 && rActivity.json?.lastTool === 'bash'
+    && String(rActivity.json?.assistantTail ?? '').includes('extra')
+  // 纪要翻页: before=0 → 空(第 0 条之前无事件)
+  const rHistPage = await readRes(315, 'dsh://sessions/sess-live/history/0')
+  checks['resources/read: history/{before} 翻页游标(before=0 → 空页)'] = rHistPage.json?.sessionId === 'sess-live'
+    && Array.isArray(rHistPage.json?.turns) && rHistPage.json.turns.length === 0
+  // 单任务资源: 完成 → 全量结果; 未知 → -32602 且提及 TTL/订阅
+  const rTask = await readRes(316, `dsh://queue/${queuedId}`)
+  checks['resources/read: dsh://queue/{taskId}(完成含 full 投影结果)'] = rTask.json?.status === 'done'
+    && rTask.json?.result?.detail === 'full' && rTask.json?.result?.changes === 'c1' && rTask.json?.taskId === queuedId
+  const rTaskNope = await readRes(317, 'dsh://queue/no-such-task')
+  checks['resources/read: 未知任务 → -32602(带 TTL/订阅指路)'] = String(rTaskNope.error ?? '').includes('task not found')
+    && String(rTaskNope.error ?? '').includes('taskTtlMs')
+  const rNope = await readRes(318, 'dsh://no-such-resource')
+  checks['resources/read: 未知资源 → -32602 not found'] = String(rNope.error ?? '').includes('not found')
+  // 模板清单 + completion
+  const tmplList = await rpc(init.sid, { jsonrpc: '2.0', id: 319, method: 'resources/templates/list', params: {} })
+  const tmplUris: string[] = tmplList.status === 200 ? (parsePayload(tmplList.text).result?.resourceTemplates ?? []).map((t: any) => t.uriTemplate) : []
+  checks['resources/templates/list: 模板全集(含翻页游标变体)'] = ['dsh://queue/{taskId}', 'dsh://sessions/{sessionId}',
+    'dsh://sessions/{sessionId}/history', 'dsh://sessions/{sessionId}/history/{before}',
+    'dsh://sessions/{sessionId}/events/{after}', 'dsh://sessions/{sessionId}/activity', 'dsh://models/{provider}']
+    .every((u) => tmplUris.includes(u))
+  const completeOf = async (id: number, uri: string, name: string, value: string): Promise<string[]> => {
+    const r = await rpc(init.sid, {
+      jsonrpc: '2.0', id, method: 'completion/complete',
+      params: { ref: { type: 'ref/resource', uri }, argument: { name, value } },
+    })
+    return r.status === 200 ? (parsePayload(r.text).result?.completion?.values ?? []) : []
+  }
+  checks['completion: sessionId 补全(history 模板只给 live, 元数据模板含 persisted)'] =
+    (await completeOf(320, 'dsh://sessions/{sessionId}/history', 'sessionId', 'sess')).includes('sess-live')
+    && !(await completeOf(321, 'dsh://sessions/{sessionId}/history', 'sessionId', 'sess-p')).includes('sess-persisted')
+    && (await completeOf(322, 'dsh://sessions/{sessionId}', 'sessionId', 'sess-p')).includes('sess-persisted')
+  checks['completion: provider 补全(模型目录)'] = JSON.stringify(await completeOf(323, 'dsh://models/{provider}', 'provider', 'p')) === JSON.stringify(['p1', 'p2'])
+  checks['completion: taskId 补全(队列现存)'] = (await completeOf(324, 'dsh://queue/{taskId}', 'taskId', queuedId.slice(0, 8))).includes(queuedId)
+  // HATEOAS 引用: agent_run/task_inbox 结果带资源 URI
+  checks['HATEOAS: agent_run 结果带会话纪要资源引用'] = runLiveInner.resource === 'dsh://sessions/sess-live/history'
+  checks['HATEOAS: task_inbox 结果带任务资源引用'] = inboxInner.resource === `dsh://queue/${queuedId}`
+  // ── 订阅推送: GET SSE 流上收 notifications/resources/{updated,list_changed} ──
+  // 推送是"先订阅后触发"才可确定(快任务可能在订阅落地前已完成——那正是轮询不再需要的场景:
+  // 直接读资源即得终态); 慢任务用 slow-cwd, 与后续取消链路块的 slow-cwd 隔离(不同池 key)
+  {
+    const sse = openSse(init.sid)
+    await sse.ready
+    const updatedFor = (uri: string) => sse.events.filter((e) => e.method === 'notifications/resources/updated' && e.params?.uri === uri).length
+    const hasListChanged = () => sse.events.some((e) => e.method === 'notifications/resources/list_changed')
+    let reqId = 400
+    const subscribe = async (uri: string): Promise<string> => {
+      const r = await rpc(init.sid, { jsonrpc: '2.0', id: ++reqId, method: 'resources/subscribe', params: { uri } })
+      const p = parsePayload(r.text)
+      return p.error ? String(p.error.message ?? '') : ''
+    }
+    const unsubscribe = async (uri: string) => {
+      await rpc(init.sid, { jsonrpc: '2.0', id: ++reqId, method: 'resources/unsubscribe', params: { uri } })
+    }
+    // 订阅校验: 未知任务 / persisted-only 历史 / 未知 URI → -32602
+    checks['resources/subscribe: 不可读目标拒绝(-32602)'] = (await subscribe('dsh://queue/no-such-task')).includes('task not found')
+      && (await subscribe('dsh://sessions/sess-persisted/history')).includes('not live')
+      && (await subscribe('dsh://nope')).includes('unknown resource')
+    // turn 完成推送: 先订阅 sess-live 的纪要资源, 再跑 agent_run(确定性顺序)
+    const historyUri = 'dsh://sessions/sess-live/history'
+    checks['resources/subscribe: 可读目标受理'] = (await subscribe(historyUri)) === ''
+    const pushRun = await rpc(init.sid, { jsonrpc: '2.0', id: 401, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'push probe', sessionId: 'sess-live' } } })
+    checks['订阅: turn 收敛 → history 资源 updated 推送'] = pushRun.status === 200
+      && await waitFor(() => updatedFor(historyUri) >= 1, 5000, 50)
+    // 慢任务终态推送: 入队(触发 list_changed) → running → 订阅 activity+queue → cancel → 双推送
+    const slowCwdR = resolve(FAKE_CWD, 'slow-cwd-resources')
+    const inboxSlow = await rpc(init.sid, { jsonrpc: '2.0', id: 402, method: 'tools/call', params: { name: 'task_inbox', arguments: { task: 'slow push', cwd: slowCwdR } } })
+    const slowId = innerOf(inboxSlow).taskId
+    let slowSid = ''
+    for (let i = 0; i < 50 && !slowSid; i++) {
+      const tl = await rpc(init.sid, { jsonrpc: '2.0', id: 4030 + i, method: 'tools/call', params: { name: 'task_list', arguments: {} } })
+      slowSid = String((tl.status === 200 ? (innerOf(tl).tasks ?? []) : []).find((t: any) => t.taskId === slowId)?.sessionId ?? '')
+      if (!slowSid) await new Promise((r) => setTimeout(r, 100))
+    }
+    checks['resources/subscribe: 慢任务活动窗口与队列资源受理'] = (await subscribe(`dsh://sessions/${slowSid}/activity`)) === ''
+      && (await subscribe(`dsh://queue/${slowId}`)) === ''
+    const gotActivity = await waitFor(() => updatedFor(`dsh://sessions/${slowSid}/activity`) >= 1, 5000, 50)
+    const cancelSlow = await rpc(init.sid, { jsonrpc: '2.0', id: 404, method: 'tools/call', params: { name: 'task_cancel', arguments: { taskId: slowId } } })
+    // 执行中取消: cancelling=true(取消已送达), 终态等 agent 收敛后再推送(queue 资源 updated)
+    checks['订阅: 取消任务 → 队列资源终态推送'] = innerOf(cancelSlow).cancelling === true
+      && await waitFor(() => updatedFor(`dsh://queue/${slowId}`) >= 1, 5000, 50)
+    checks['订阅: 活动窗口推送(turn 运行期)'] = gotActivity
+    checks['订阅: list_changed 广播(入队/会话事件)'] = hasListChanged()
+    // 订阅观测进状态快照
+    const statusSub = await rpc(init.sid, { jsonrpc: '2.0', id: 405, method: 'tools/call', params: { name: 'dsh_status', arguments: {} } })
+    checks['dsh_status: stats.subscriptions 订阅观测'] = (statusSub.status === 200 ? innerOf(statusSub).stats?.subscriptions?.subscriptions : 0) >= 3
+    // 退订: 之后 history 不再推送(再跑一轮 agent_run, 计数不增长)
+    await unsubscribe(historyUri)
+    const beforeCount = updatedFor(historyUri)
+    const postRun = await rpc(init.sid, { jsonrpc: '2.0', id: 406, method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'after unsub', sessionId: 'sess-live' } } })
+    checks['resources/unsubscribe: 退订后停止推送'] = postRun.status === 200 && updatedFor(historyUri) === beforeCount
+    sse.close()
+  }
+
+
   // ── 取消链路: agent_run 经 MCP notifications/cancelled → 官方 agent.cancel({kind:'user'}) ──
   // 注意: 规范要求服务端对已取消请求 SHOULD NOT 回响应, 所以这里不 await 响应体,
   // 断言服务端效果(cancel 被调用一次), 最后主动断开连接。
@@ -459,7 +689,9 @@ try {
     && listArr.find((t) => t.taskId === idA)?.status === 'running'
     && listArr.find((t) => t.taskId === idB)?.status === 'cancelled'
   const cancelA = await rpc(init.sid, { jsonrpc: '2.0', id: 66, method: 'tools/call', params: { name: 'task_cancel', arguments: { taskId: idA } } })
-  checks['task_cancel: 执行中任务接受取消'] = innerOf(cancelA).cancelled === true
+  // 执行中取消: cancelling=true 表示 abort 已送达(官方 agent.cancel), 状态保持 running 直到真正收敛
+  checks['task_cancel: 执行中任务接受取消(cancelling, 未过早标 cancelled)'] = innerOf(cancelA).cancelling === true
+    && innerOf(cancelA).status === 'running'
   // 等 runner 经官方 cancel 收敛(轮询)
   let resA: any = {}
   for (let i = 0; i < 50 && resA.status !== 'cancelled'; i++) {
@@ -822,7 +1054,7 @@ try {
     }
     checks['队列持久化: queued 重启后重新执行'] = gBItem?.status === 'running'
     const gCancel = innerOf(await phaseG2.call('task_cancel', { taskId: gB.taskId }))
-    checks['队列持久化: 重启后的任务可取消'] = gCancel.cancelled === true
+    checks['队列持久化: 重启后的任务可取消'] = gCancel.cancelling === true
     // 原子写的本意是 ".tmp 是瞬态的": 轮询等它消失(写入链在负载下可能慢于任何固定 sleep)
     checks['队列持久化: 无 .tmp 残留(原子写)'] = await waitFor(() => !existsSync(`${persistPath}.tmp`), 5000)
     try { unlinkSync(persistPath) } catch { /* 已清理 */ }
@@ -942,7 +1174,7 @@ try {
 
   // ── Phase M: 持久化文件损坏 —— 启动必须存活, 队列从空开始 ──
   {
-    const badPath = resolve(FAKE_CWD, '.smoke-queue-bad.json')
+    const badPath = resolve(tmpdir(), 'dsh-carrot-smoke-queue-bad.json')
     writeFileSync(badPath, '{corrupted json', 'utf8')
     const phaseM = await startPhase(8085, makeCtx({ llm: fakeLlm }), { queuePersistPath: badPath })
     const tlM = innerOf(await phaseM.call('task_list', {}))
@@ -1128,6 +1360,67 @@ try {
     try { unlinkSync(legacyPath) } catch { /* 已清理 */ }
   }
 
+  // ── Phase Y: 初始化窗口取消 + 取消窗口的工具面可见性 —— create 停在闸门上拉长 getAgent 窗口 ──
+  {
+    const ctxY = makeCtx({ llm: fakeLlm })
+    let releaseCreate: () => void = () => {}
+    const gate = new Promise<void>((r) => { releaseCreate = r })
+    const origCreate = ctxY.agents.create
+    ctxY.agents.create = async (args: any) => { await gate; return origCreate(args) }
+    const phaseY = await startPhase(8081, ctxY, {})
+    const gateCwd = resolve(FAKE_CWD, 'nonexistent-gate')
+    const yInbox = innerOf(await phaseY.call('task_inbox', { task: 'cancel during init', cwd: gateCwd }))
+    // 等 running(onStart 与 getAgent 同处投递链: 观察到 running 即已进入 getAgent 窗口, 停在闸门上)
+    let yRunning = false
+    for (let i = 0; i < 50 && !yRunning; i++) {
+      const tlY: any[] = innerOf(await phaseY.call('task_list', { status: 'running' }))?.tasks ?? []
+      yRunning = tlY.some((t) => t.taskId === yInbox.taskId)
+      if (!yRunning) await new Promise((r) => setTimeout(r, 100))
+    }
+    // 取消监听生命周期: 注册确有发生(执行中挂在调用方 signal 上; 须在取消前查——abort 触发后由 once:true 自摘)
+    const yItem = pluginState.taskQueue.get(yInbox.taskId)
+    checks['取消监听: 任务执行中挂在调用方 signal 上'] = yItem?.controller !== undefined
+      && getEventListeners(yItem.controller.signal, 'abort').length === 1
+    // 初始化窗口内取消: cancelling=true、状态保持 running(未过早终态)
+    const yCancel = innerOf(await phaseY.call('task_cancel', { taskId: yInbox.taskId }))
+    checks['task_cancel: 初始化窗口取消返回 cancelling(未过早终态)'] = yCancel.cancelling === true && yCancel.status === 'running'
+    // 取消窗口期内标记必须在工具面可见(task_list 的 outputSchema 不剥字段; 轻量轮询也带)
+    const yListW = innerOf(await phaseY.call('task_list', {}))
+    checks['task_list: 取消窗口期带 cancelRequested(outputSchema 未过滤)'] = (yListW.tasks ?? []).some((t: any) => t.taskId === yInbox.taskId && t.cancelRequested === true)
+    const yStatusW = innerOf(await phaseY.call('task_result', { taskId: yInbox.taskId, detail: 'status' }))
+    checks['task_result status: 取消窗口期带 cancelRequested'] = yStatusW.status === 'running' && yStatusW.cancelRequested === true
+    // 放行 create: executeTask 在投递前复查取消 → 不投递、零 followup, 终态 cancelled
+    releaseCreate()
+    let yFinal: any = {}
+    for (let i = 0; i < 50 && yFinal.status !== 'cancelled'; i++) {
+      const yr = await phaseY.call('task_result', { taskId: yInbox.taskId, detail: 'status' })
+      yFinal = yr.status === 200 ? innerOf(yr) : {}
+      if (yFinal.status !== 'cancelled') await new Promise((r) => setTimeout(r, 100))
+    }
+    const createdY = created.filter((c) => c.cwd === gateCwd)
+    checks['初始化窗口取消: 会话已建但不投递(零 followup)且终态 cancelled'] = yFinal.status === 'cancelled'
+      && createdY.length === 1
+      && followups.filter((f) => f.id === createdY[0]?.id).length === 0
+    // 收敛后窗口关闭: cancelRequested 标记消失
+    const yListF = innerOf(await phaseY.call('task_list', {}))
+    checks['task_list: 收敛后 cancelRequested 标记消失'] = (yListF.tasks ?? []).every((t: any) => t.taskId !== yInbox.taskId || t.cancelRequested === undefined)
+    // 监听清理(getAgent 抛错路径): 未知 sessionId 的任务初始化失败(无 abort 触发, once 自摘不适用),
+    // executeTask 上抛前必须显式摘除监听, 否则残留在队列条目的 controller.signal 上
+    const leakInbox = innerOf(await phaseY.call('task_inbox', { task: 'leak probe', sessionId: 'sess-unknown' }))
+    let leakStatus: any = {}
+    for (let i = 0; i < 50 && !String(leakStatus.error ?? '').includes('"status":"error"'); i++) {
+      const lr = await phaseY.call('task_result', { taskId: leakInbox.taskId, detail: 'status' })
+      leakStatus = lr.status === 200 ? innerOf(lr) : {}
+      if (!String(leakStatus.error ?? '').includes('"status":"error"')) await new Promise((r) => setTimeout(r, 100))
+    }
+    const leakItem = pluginState.taskQueue.get(leakInbox.taskId)
+    checks['取消监听: 初始化失败(getAgent 抛错)后不残留'] = String(leakStatus.error ?? '').includes('session not found for resume')
+      && leakItem?.controller !== undefined
+      && getEventListeners(leakItem.controller.signal, 'abort').length === 0
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
   // ── Phase J: GUI 控制面路由 —— status 快照 / stop-start 同源门禁 / 软停启循环 ──
   {
     const { EventEmitter } = await import('node:events')
@@ -1170,6 +1463,52 @@ try {
     })
     checks['GUI start 后真实 HTTP 握手可达'] = afterStart.status === 200 && Boolean(afterStart.headers.get('mcp-session-id'))
     await afterStart.text()
+    for (const d of disposers.splice(0)) if (typeof d === 'function') d()
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
+  // ── Phase RF: resourceFirst 部署形态(独立端口独立 ctx)——只读工具下线, 数据走资源面 ──
+  // 注意: state 是模块级单例, 本 phase 在所有主流程 phase 之后执行(覆盖 state.config/hooks 不影响前文断言)
+  {
+    const ctxRF = makeCtx({ sessionController: fakeSessionController, llm: fakeLlm, sessionTitle: fakeSessionTitle })
+    await apply(ctxRF, { port: 8096, host: '127.0.0.1', resourceFirst: true })
+    await new Promise((r) => setTimeout(r, 200))
+    // 此前主流程 phase 已 dispose 掉 8099 的 server, RF 阶段统一打 8096
+    const RF_BASE = 'http://127.0.0.1:8096/mcp'
+    const initRF = await rpc(undefined, {
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'smoke-rf', version: '1.0' } },
+    }, {}, RF_BASE)
+    const rfSid = initRF.sid
+    const rfInitResult = initRF.status === 200 ? parsePayload(initRF.text).result : undefined
+    await rpc(rfSid, { jsonrpc: '2.0', method: 'notifications/initialized' }, {}, RF_BASE)
+    const rpcRF = (id: number, body: any) => rpc(rfSid, { jsonrpc: '2.0', id, ...body }, {}, RF_BASE)
+    checks['resourceFirst: instructions 指路资源面'] = String(rfInitResult?.instructions ?? '').includes('resource-first')
+      && String(rfInitResult?.instructions ?? '').includes('dsh://')
+    const rfTools = await rpcRF(2, { method: 'tools/list', params: {} })
+    const rfNames: string[] = rfTools.status === 200 ? (parsePayload(rfTools.text).result?.tools ?? []).map((t: any) => t.name) : []
+    checks['resourceFirst: 只读工具 9 个下线(剩 7 个动作工具)'] = rfNames.length === 7
+      && ['echo', 'agent_run', 'agent_steer', 'task_inbox', 'select_model', 'rename_session', 'attach_session'].every((n) => rfNames.includes(n))
+      && !rfNames.includes('task_list') && !rfNames.includes('session_list') && !rfNames.includes('session_history')
+      && !rfNames.includes('model_list') && !rfNames.includes('task_result') && !rfNames.includes('dsh_status')
+    const rfList = await rpcRF(3, { method: 'resources/list', params: {} })
+    const rfUris: string[] = rfList.status === 200 ? (parsePayload(rfList.text).result?.resources ?? []).map((r: any) => r.uri) : []
+    checks['resourceFirst: 资源面齐备(数据本体)'] = ['dsh://status', 'dsh://models', 'dsh://presets', 'dsh://sessions', 'dsh://queue', 'dsh://agents', 'dsh://tools']
+      .every((u) => rfUris.includes(u))
+    // agent_run 默认 detail=uri: 只回引用, 数据经 resource 读取
+    const rfRun = await rpcRF(4, { method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-live' } } })
+    const rfRunInner = rfRun.status === 200 ? innerOf(rfRun) : { error: 'bad' }
+    checks['resourceFirst: agent_run 默认 uri 档(引用 + note, 不注入 payload)'] = rfRunInner.detail === 'uri'
+      && rfRunInner.sessionId === 'sess-live' && rfRunInner.resource === 'dsh://sessions/sess-live/history'
+      && rfRunInner.changes === undefined && rfRunInner.assistantTail === undefined
+      && String(rfRunInner.note ?? '').includes('resource')
+    // 显式 detail 仍可拿到内联投影(逃生门)
+    const rfRunFull = await rpcRF(5, { method: 'tools/call', params: { name: 'agent_run', arguments: { task: 'say ok', sessionId: 'sess-live', detail: 'summary' } } })
+    checks['resourceFirst: detail=summary 逃生门(内联投影)'] = rfRunFull.status === 200 && innerOf(rfRunFull).changes === 'c1'
+    // 数据经资源面: history 资源可读(替代 session_history 工具)
+    const rfHist = await rpcRF(6, { method: 'resources/read', params: { uri: 'dsh://sessions/sess-live/history' } })
+    const rfHistInner = rfHist.status === 200 ? JSON.parse(parsePayload(rfHist.text).result.contents[0].text) : {}
+    checks['resourceFirst: 资源面承接 session_history'] = rfHistInner.sessionId === 'sess-live' && rfHistInner.turns?.length > 0
     for (const d of disposers.splice(0)) if (typeof d === 'function') d()
     await new Promise((r) => setTimeout(r, 150))
   }

@@ -1,6 +1,6 @@
 // Dev-only: 端口冲突时 apply() 必须显式 reject(旧行为是静默成功)
 import net from 'node:net'
-import { apply } from './lib/index.js'
+import { apply } from '../lib/index.js'
 
 // 假 ctx 不是真 cordis(webServer 类可选依赖不出现), 假宿主边界不做结构校验
 const ctx: any = {

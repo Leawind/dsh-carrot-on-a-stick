@@ -15,9 +15,11 @@ export const selectModelCalls = []
 export const disposers = []
 export const steered = []
 export const injected = []
+// 每次 followup 一条(按 agent id): 断言"任务实际执行了几次"(幂等去重/取消窗口的执行计数证据)
+export const followups = []
 
-// smoke 文件所在目录的 realpath(win32 反斜杠规范路径) —— 与 workspace.path / fs.realpath 结果同 canon
-export const FAKE_CWD = realpathSync(new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+// 仓库根的 realpath(win32 反斜杠规范路径) —— 与 workspace.path / fs.realpath 结果同 canon
+export const FAKE_CWD = realpathSync(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 
 const fakeWs = {
   id: 'ws-fake',
@@ -48,14 +50,20 @@ function makeAgent(id, cwd, options) {
       snapshotEvents: (from = 0) => events.slice(from),
     },
     followup: (message) => {
+      followups.push({ id })
       events.push({ type: 'user/message', data: { message } })
       events.push({ type: 'turn/start', data: { turn: 1 } })
       events.push({ type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls"}' } })
       events.push({ type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'file-a file-b' }] } } })
       events.push({
         type: 'assistant/message',
-        // usage 桩(TokenUsage 形状): 验证结果的机会式用量聚合
-        data: { message: { content: [{ type: 'text', text: 'done {"changes":"c1","verification":"v1","leftovers":"l1"}' }], usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 } } },
+        // usage 桩(TokenUsage 形状): 0.1.7+ 在事件载荷上, 更早宿主在 message.usage——
+        // 两条各带一处, 验证双形状的机会式用量聚合(120/45/165 = 100+20 / 30+15 / 130+35)
+        data: { message: { content: [{ type: 'text', text: 'done {"changes":"c1","verification":"v1","leftovers":"l1"}' }] }, usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } },
+      })
+      events.push({
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: 'extra' }], usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 } } },
       })
     },
     whenIdle: async () => {},
@@ -97,6 +105,7 @@ function makeSlowAgent(id, cwd, options) {
       snapshotEvents: (from = 0) => events.slice(from),
     },
     followup: (message) => {
+      followups.push({ id })
       events.push({ type: 'user/message', data: { message } })
       events.push({ type: 'turn/start', data: { turn: 1 } })
     },
@@ -113,6 +122,7 @@ const errAgent = (() => {
   return {
     session: { id: 'sess-err', header: { version: 0, id: 'sess-err', createdAt: 1, cwd: FAKE_CWD }, snapshotEvents: (from = 0) => events.slice(from) },
     followup: (message) => {
+      followups.push({ id: 'sess-err' })
       events.push({ type: 'user/message', data: { message } })
       events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { code: 'AUTH', message: 'invalid api key' } } } })
     },
@@ -198,9 +208,10 @@ export function makeCtx(opts: {
     flush: async (session) => { flushed.push(session.id); return true },
   }
   // 0.1.5+ 的 SessionPersistenceSnapshot(header 在 .header) + 一条旧版裸 header 形状(+ phase 注入的额外持久化会话)
+  // sess-persisted 带原始 agentPreset('reviewer'): 验证 resume 恢复会话原 preset 而非部署默认
   const fakePersistence = {
     list: async () => [
-      { header: { version: 0, id: 'sess-persisted', createdAt: 1, cwd: FAKE_CWD } },
+      { header: { version: 0, id: 'sess-persisted', createdAt: 1, cwd: FAKE_CWD, agentPreset: 'reviewer' } },
       { version: 0, id: 'sess-legacy', createdAt: 2, cwd: FAKE_CWD },
       ...extraPersisted.map((s, i) => ({ header: { version: 0, id: s.id, createdAt: 3 + i, cwd: s.cwd } })),
     ],
@@ -240,8 +251,8 @@ export function makeCtx(opts: {
     },
     agentPresets: {
       mount: async (agentCtx, id) => { mounted.push(id ?? 'standard'); return { id: id ?? 'standard' } },
-      // roster(校验 per-call preset 存在性): standard(默认) + reviewer(测试用自定义人格)
-      list: async () => [{ id: 'standard' }, { id: 'reviewer' }],
+      // roster(校验 per-call preset 存在性 + dsh://presets 资源投影): standard 带 name/description, reviewer 只有 id
+      list: async () => [{ id: 'standard', name: 'Standard', description: 'default persona' }, { id: 'reviewer' }],
     },
     sessions: fakeSessions,
     sessionPersistence: fakePersistence,
@@ -270,8 +281,8 @@ export function makeCtx(opts: {
 export const PORT = 8099
 export const BASE = `http://127.0.0.1:${PORT}/mcp`
 
-export async function rpc(sessionId, body, extraHeaders = {}) {
-  const res = await fetch(BASE, {
+export async function rpc(sessionId, body, extraHeaders = {}, base = BASE) {
+  const res = await fetch(base, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -328,4 +339,38 @@ export async function waitFor(fn, timeoutMs = 5000, step = 100) {
     if (Date.now() > deadline) return false
     await new Promise((r) => setTimeout(r, step))
   }
+}
+
+/**
+ * 打开该会话的 GET SSE 流(StreamableHTTP 的服务端→客户端通知通道), 收集 JSON-RPC 通知。
+ * 资源订阅(notifications/resources/updated | list_changed)经此投递——不打开本流的客户端
+ * 收不到推送, 这是 StreamableHTTP 的传输语义而非插件行为。
+ */
+export function openSse(sessionId: string): { events: any[]; ready: Promise<void>; close: () => void } {
+  const events: any[] = []
+  const controller = new AbortController()
+  const ready = (async () => {
+    const res = await fetch(BASE, {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream', 'Mcp-Session-Id': sessionId },
+      signal: controller.signal,
+    })
+    const reader = (res.body as any).getReader()
+    const decoder = new TextDecoder()
+      ;(async () => {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+              const t = line.trim()
+              if (t.startsWith('data: ')) {
+                try { events.push(JSON.parse(t.slice(6))) } catch { /* 非 JSON 行(心跳注释等)忽略 */ }
+              }
+            }
+          }
+        } catch { /* 流被 close() 中断: 正常退出路径 */ }
+      })()
+  })().catch(() => { /* 连接失败: 断言会在 events 上超时暴露 */ })
+  return { events, ready, close: () => controller.abort() }
 }

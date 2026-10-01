@@ -52,8 +52,8 @@ export async function sessionCwdRefusal(sessionId: string, cwd: string | undefin
   return undefined
 }
 
-/** cwd 规范化(realpath) + 白名单校验(配置了 workspaceRoots 时)。task_inbox 在提交时即调用, 越界任务入队前就失败 */
-export async function canonicalizeAllowedCwd(cwd: string): Promise<string> {
+/** cwd 规范化(realpath) + 白名单校验(配置了 workspaceRoots 时)。缺省 cwd 按进程 cwd 处理。task_inbox 在提交时即调用, 越界任务入队前就失败 */
+export async function canonicalizeAllowedCwd(cwd: string | undefined): Promise<string> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())

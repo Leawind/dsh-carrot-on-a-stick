@@ -54,10 +54,10 @@ sequenceDiagram
 | `model_list` | 列出当前可路由的 provider、模型 id、推理档与缺省选择（选模型前先查这里） |
 | `agent_run` | 同步执行任务，返回结构化结果；`sessionId` 续接会话；`provider`/`model`/`reasoningEffort` 指定本次模型；`preset` 为**新建**会话选人格；`detail` 分级控制返回体积；支持 MCP `notifications/cancelled` 取消（走宿主官方 `agent.cancel`）；调用方传 `_meta.progressToken` 时发 `notifications/progress` 心跳 |
 | `agent_steer` | 对运行中的 agent 实时干预——`mode=steer`（默认）把转向指令送到当前 turn 的下个 step 边界消化；`mode=inject` 注入模型可见的补充上下文、不唤醒驱动；目标二选一：`sessionId`（常驻池/live）或 `taskId`（执行中的队列任务）；空闲会话拒绝 steer（请改用 `agent_run`） |
-| `task_inbox` | 把结构化任务（任务+上下文+cwd+模型+preset）推入异步队列，返回 `taskId` |
+| `task_inbox` | 把结构化任务（任务+上下文+cwd+模型+preset）推入异步队列，返回 `taskId`；可选 `idempotencyKey` 幂等去重（重复提交返回原任务，响应丢失重试不重复执行） |
 | `task_result` | 取回队列任务结果；`detail=status` 轻量轮询，不重复注入 payload |
 | `task_list` | 列出队列中的任务（排队/执行中/已结束；队列可观测） |
-| `task_cancel` | 取消排队或执行中的任务（执行中走宿主官方 `agent.cancel`） |
+| `task_cancel` | 取消排队或执行中的任务（执行中走宿主官方 `agent.cancel`）：排队中立即出队终态 `cancelled`；执行中返回 `cancelling:true`，状态保持 `running` 直到 agent 真正收敛才翻转 `cancelled`（区分"正在取消"与"确认停止"） |
 | `session_list` | 列出已知会话元数据（live+持久化合并，按创建时间倒序），供挑选续接的 `sessionId` |
 | `session_history` | 读 live 会话的对话纪要（user/assistant/tool 轮次，从最新往回取，文本截断）；`roles` 可只取指定类型（如 `["assistant"]` 只看回答，跳过工具噪声） |
 | `select_model` | 切换**已存在会话**使用的模型（官方 `sessionController.selectModel` 路径） |
@@ -83,7 +83,9 @@ sequenceDiagram
 - **常驻会话池按 `cwd + 模型三元组 + preset` 分组**。同一目录下用 A 模型跑任务 1、B 模型跑任务 2，是两个独立会话（上下文不串联），这样"哪个会话在用哪个模型"始终可预期；想在一个会话里换模型就用 `select_model`。
 - 结果里新增 `model: {provider, model, reasoningEffort?}`（以及可知时的 `preset`），调用方不用猜这次是谁答的。
 
-**per-call preset（人格）**——`agent_run` / `task_inbox` 可传 `preset`（`agentPresets` roster 里的 id），为**新建会话**选人格；池 key 含 preset，同一目录下"干活的 agent"和"审代码的 agent"可以共存。接管已有会话（`sessionId`）沿用该会话创建时的 preset——想换人格就开新会话（与模型同语义）。部署可用 `allowPresetOverride: false` 锁死；未知 preset id 会被拒绝并附可用清单。
+**per-call preset（人格）**——`agent_run` / `task_inbox` 可传 `preset`（`agentPresets` roster 里的 id），为**新建会话**选人格；池 key 含 preset，同一目录下"干活的 agent"和"审代码的 agent"可以共存。接管已有会话（`sessionId`）沿用该会话创建时的 preset——想换人格就开新会话（与模型同语义）；持久化 resume 同样从会话 header 恢复原 preset（旧会话无记录时回落部署默认，结果里如实回报实际挂载值）。部署可用 `allowPresetOverride: false` 锁死；未知 preset id 会被拒绝并附可用清单。
+
+**续接会话的执行目录**——按 `sessionId` 续接时，会话自身目录是权威执行目录：不传 `cwd` 即沿用会话目录；显式传入的 `cwd` 必须与会话目录一致（realpath 规范化后精确比较），否则明确拒绝——防止"以为在 A 工作树、实际在 B 工作树执行"。目录统一解析后，按目录与按会话两种入口落到同一把 cwd 串行锁，同一会话的所有调用严格串行。
 
 `model_list` 的 `source` 说明目录口径：`sessionController` = 官方口径（与 Web UI 模型选择器同一数据源，含 `default` / `routableProviders` / 各 provider 的加载失败与推理档）；`llm` = 回退口径（`llm.listProviders()` + 逐个 `listModels()`，用于没有 `sessionController` 的部署，如 headless，不含推理档元数据）。同时回报插件自身的模型配置与 `allowModelOverride`，调用方一眼能看出"我能不能自己选"。
 
@@ -114,13 +116,15 @@ sequenceDiagram
 
 ```json
 { "name": "task_inbox", "arguments": { "task": "…", "cwd": "/workspace/app", "provider": "deepseek-official", "model": "…" } }
-→ { "taskId": "…" }
+→ { "taskId": "…", "resource": "dsh://queue/<taskId>" }
 { "name": "task_result", "arguments": { "taskId": "…", "detail": "status" } }   // 轮询: 不重复注入 payload
 { "name": "task_cancel", "arguments": { "taskId": "…" } }                        // 可选
 { "name": "task_result", "arguments": { "taskId": "…" } }                        // 完成后取一次总结
 ```
 
-`task_list` 一览全部排队/执行中/已结束的任务。
+`task_list` 一览全部排队/执行中/已结束的任务。支持 resources 的客户端可以完全不轮询：对返回的
+`dsh://queue/{taskId}` 做 `resources/subscribe`，每次状态迁移都会以 `notifications/resources/updated`
+推到 SSE 流上——收到后重读资源即可，资源内容即事实（终态那次读取带全量结果）。见工作流 6。
 
 **3. 发现并驾驭会话**——找到对的会话、确认它的模型、回看发生了什么：
 
@@ -146,9 +150,39 @@ sequenceDiagram
 `steer` 在当前 turn 的下个 step 边界被消化（turn 照常结束并回收成完整结构化结果）；`inject`
 注入模型可见的上下文、不唤醒驱动。对空闲会话 steer 会被拒绝并提示改用 `agent_run`。
 
-**6. 零 token 浏览**——MCP resources 与只读工具同数据（`dsh://status`、`dsh://queue`、
-`dsh://sessions`、`dsh://sessions/{sessionId}/history`）：支持 resources 的客户端用
-`resources/list` + `resources/read` 浏览，白名单边界与工具相同。
+**6. 资源面：零 token 浏览 + 订阅替代轮询**——MCP resources 是数据面本体（与工具同数据、同白名单
+边界），并带推送：
+
+| URI | 内容 |
+|---|---|
+| `dsh://status[/config|/stats|/connections]` | 部署状态，按变化频率拆分 |
+| `dsh://guide[/{section}]` | dsh 使用指南，整份或分节（markdown） |
+| `dsh://tools` | 宿主全局工具注册表（带"通常为空"的自述） |
+| `dsh://models[/{provider}]` | 可路由模型目录（`model_list` 同数据） |
+| `dsh://presets` | preset 花名册——`agent_run` 的 `preset` 参数合法取值 |
+| `dsh://workspaces[/{id}]` | 工作区花名册（`workspace_list` 同数据） |
+| `dsh://sessions[/{id}]` | 会话清单 / 单会话元数据（persisted-only 也可读，带 `historyReadable` 指路） |
+| `dsh://sessions/{id}/history[/{before}]` | 对话纪要，从新到旧，`{before}` 为翻页游标 |
+| `dsh://sessions/{id}/events[/{after}]` | 原始事件流（JSONL，游标续读） |
+| `dsh://sessions/{id}/activity` | 当前 turn 活动窗口（active/轮数/最近工具/回答尾部） |
+| `dsh://queue[/{taskId}]` | 队列快照 / 单任务明细（完成含全量结果） |
+| `dsh://agents` | 常驻会话池明细（cwd/preset/model/是否活跃 turn） |
+
+模板变量支持 `completion/complete` 补全（sessionId/taskId/provider）。读取遵循 MCP 错误语义：
+未知或不可读资源返回 `-32602` 并带原因与替代路径（绝不返回空 `contents` 数组）。
+
+**订阅**（server 声明 `resources: { listChanged, subscribe }`）：对任何可读 URI
+`resources/subscribe`，之后该连接的 SSE 流上会收到 `notifications/resources/updated` 推送——
+`dsh://queue/{taskId}` 的任务状态迁移（免轮询；`updated` 只是"该重读了"的信号，资源内容即事实）、
+`dsh://sessions/{id}/history` 的 turn 收敛刷新、`dsh://sessions/{id}/activity` 的节流实时进度。
+清单成员变化（新会话/入队/清扫）广播 `notifications/resources/list_changed`。推送走
+StreamableHTTP 标准的 GET SSE 通道，不打开该流的客户端收不到推送（读取永远可用）。
+
+**`resourceFirst: true`**（config）是面向资源型客户端的部署形态：九个只读工具下线
+（`dsh_get_started`/`dsh_list_tools`/`dsh_status`/`model_list`/`workspace_list`/`task_list`/
+`task_result`/`session_list`/`session_history`），`agent_run` 默认 `detail: "uri"`——结果以资源
+引用返回，需要内联时传 `detail: summary|normal|full`。默认 `false`：工具与资源并存，
+对不知 resources 的客户端零行为变化。
 
 ## 安装与运行
 
@@ -234,8 +268,9 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 | `allowPresetOverride` | `true` | 是否允许调用方（`agent_run`/`task_inbox`）为新建会话选 preset；`false` = 部署锁死，覆盖请求被明确拒绝 |
 | `preset` | `standard` | 挂载的 agent preset（部署默认/per-call 回退；per-call `preset` 只对新建会话生效——接管已有会话沿用其原 preset） |
 | `defaultDetail` | `summary` | `agent_run`/`task_result` 的默认详略级别（单次调用可用 `detail` 覆盖） |
+| `resourceFirst` | `false` | 资源优先部署形态：九个只读工具下线，数据走 resources 面（`dsh://…`），`agent_run` 默认 `detail: "uri"`。面向确认支持 MCP resources 的客户端 |
 | `reattachOrphans` | `false` | 启动时把未分组会话补挂到工作区（批量写用户数据，默认关；`attach_session` 工具随时可用） |
-| `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 10 分钟 / `8` | 队列容量、结果保留时长、会话池 LRU 上限 |
+| `maxQueue` / `taskTtlMs` / `maxAgents` | `100` / 24 小时 / `8` | 队列容量、结果保留时长（完成结果在保留期内可随时取回）、会话池 LRU 上限 |
 | `taskTimeoutMs` | `0`（关闭） | agent turn 自动超时；到点走官方 `agent.cancel({kind:'hook'})`，结果 `error` 注明超时。长任务部署请调大或保持关闭 |
 | `progressIntervalMs` | `5000`（最小 250） | `agent_run` 的 `notifications/progress` 心跳间隔——仅当调用方传 `_meta.progressToken` 时生效 |
 | `queuePersistPath` | —（关闭） | 任务队列持久化文件：每次变化即落盘；重启后 done/error/cancelled 连结果取回、queued 重新执行、running 如实标记 `interrupted by restart` |
@@ -306,17 +341,18 @@ CORS 暴露。
 - **贴合当前版本 dsh**：见下方 Roadmap；
 - **独立命名与仓库**：`dsh-carrot-on-a-stick`。
 
-## Roadmap / 已知限制（对 dsh 0.1.5-rc.2）
+## Roadmap / 已知限制（对 dsh 0.2.0-rc.2）
 
 0.2.0 Roadmap 的兼容性问题已在 0.3.0 处理；**0.3.1 完成真机 E2E 验证**（全绿，见 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md)），并修复 E2E 发现的问题：`{{model}}` 提示词变量（模型选择现经 `agentDefaultModel` 补全）、turn 失败透出、池会话 flush、存量捞回默认关闭、安装流程文档修正。
+**最新批次（未发布）已迁移到 dsh 0.2.0-rc.2**（npm `latest`/`next` 双标签）：源码零改动——0.1.7 迁移建立的兼容层（`{kind:'user'}` source、usage 双形状读取、`dsh-agent-preset-registry` 导入）天然覆盖 0.2.0，仅 devDeps 类型同步；真机 E2E 零 token 相 14/14 全绿、agent 相 E2E PASS，见 [docs/e2e-0.2.0-rc.2.zh.md](./docs/e2e-0.2.0-rc.2.zh.md)。
 **0.5.0 补齐模型选择面**：`model_list`（官方目录 / `llm` 回退）、`agent_run`+`task_inbox` 的按调用覆盖、`select_model`（会话内换模型）、`reasoningEffort`、`allowModelOverride` 门禁、结果自报 `model`、会话池按 `cwd + 模型` 分组。
-**最新批次（未发布）**：`agent_steer`（对运行中 agent 实时转向/注入，按 `sessionId` 或执行中的 `taskId`；空闲会话拒绝 steer）、per-call `preset`（池按 `cwd + 模型 + preset` 分组、`allowPresetOverride` 门禁）、进度心跳增强（turn 轮数 + 最近工具）与结果增强（`durationMs`、机会式 `usage`）、`dsh_status` + `workspace_list` 工具、MCP resources 面（`dsh://status`、`dsh://queue`、`dsh://sessions`、逐会话 history，与工具同白名单边界）。详见 CHANGELOG（批次 18）。
+**最新批次（未发布）**：MCP resources 全面利用——全部读面资源化（`dsh://status` 细分 / guide 分节 / `presets`/`agents`/`tools`/`models`/`workspaces` / 逐会话 history·events·activity 游标翻页），`resources/subscribe` 订阅推送（任务状态迁移 / turn 收敛历史刷新 / 节流实时活动，沿 SSE 流下行，另有 `list_changed` 广播），模板变量 `completion/complete` 补全，资源带 `annotations`（audience/priority/lastModified），读取遵循 `-32602` 错误契约，可选 `resourceFirst` 配置为资源型部署下线只读工具。详见 CHANGELOG（批次 25）。
 **上一批次（未发布）覆盖六个方向**，逐批细节见 CHANGELOG：
 
 - **协议一致性**：工具错误结果带 `isError: true`、DNS rebinding 防护补上 Origin 头校验、401 带 `WWW-Authenticate` 挑战、工具暴露 `title` + `annotations`、空闲传输会话自动回收（`sessionTtlMs`）、10MB 请求体上限；
 - **取消**：`agent_run` 支持 MCP `notifications/cancelled` 与客户端超时（都接到宿主官方 `agent.cancel`）；
 - **可观测**：`notifications/progress` 进度心跳（规范 `_meta.progressToken`）、`task_list`、只读 `session_list`（含当前模型）与 `session_history`（可翻页）；
-- **异步队列**：`task_cancel`、可选持久化（`queuePersistPath`，原子写）、`running`/`interrupted` 状态如实上报；
+- **异步队列**：`task_cancel`、可选持久化（`queuePersistPath`，原子写）、`running`/`interrupted` 状态如实上报；turn 失败的任务终态如实标 `error`（结果本体仍可取回，状态轮询即可见）；执行中取消区分 `cancelling`（已送达官方 cancel）与 `cancelled`（确认收敛），收敛前的任务带 `cancelRequested` 标记；`idempotencyKey` 提交去重；
 - **韧性**：锁表清理、LRU 淘汰跳过活跃会话、损坏持久化文件启动存活；
 - 协议审查报告见 [docs/protocol-audit-2026-09-24.zh.md](./docs/protocol-audit-2026-09-24.zh.md)。
 
@@ -339,15 +375,15 @@ CORS 暴露。
 npm install
 npm run build    # 独立构建(纯 tsc), 产出 lib/
 npm run typecheck  # 测试 TS 文件类型检查(不产出)
-npm run smoke    # 端口 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085/8083/8082 假 ctx 冒烟(190 项, 真实 MCP 协议往返 + 官方 SDK Client 对接; 假宿主桩在 smoke-harness.ts) + 端口冲突专项
+npm run smoke    # 端口 8099/8098/8096/8095/8094/8093/8092/8091/8089/8088/8087/8086/8085/8083/8082 假 ctx 冒烟(190 项, 真实 MCP 协议往返 + 官方 SDK Client 对接; 假宿主桩在 test/smoke-harness.ts) + 端口冲突专项
 ```
 
-测试是普通 TypeScript，直接 `node smoke.ts` 运行（Node 原生 type stripping）——仅开发脚本要求 Node ≥ 23.6；发布的插件本体仍支持 Node ≥ 18。
+测试是普通 TypeScript，直接 `node test/smoke.ts` 运行（Node 原生 type stripping）——仅开发脚本要求 Node ≥ 23.6；发布的插件本体仍支持 Node ≥ 18。
 
 源码按职责分模块(config/state/paths/persist/projection/host/engine/tools/onboarding,`index.ts` 只做装配),
 模块地图与设计约束见 [docs/architecture.zh.md](./docs/architecture.zh.md)。
 
-真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.1.5-rc.2.zh.md](./docs/e2e-0.1.5-rc.2.zh.md) 的方式起一个独立 profile，然后 `E2E_WITH_AGENT=1 node e2e.ts`。
+真机 E2E（需要本机 dsh 与模型凭证，会花少量 token）：按 [docs/e2e-0.2.0-rc.2.zh.md](./docs/e2e-0.2.0-rc.2.zh.md) 的方式起一个独立 profile（建议 `DSH_HOME` 隔离 home，不触碰常驻实例的数据；agent 相用 Temp 工作目录，避开实目录沙箱 ACL 问题），然后 `E2E_WITH_AGENT=1 node test/e2e.ts`。
 
 ## License
 

@@ -9,11 +9,10 @@
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import { randomUUID } from 'node:crypto'
-import { PLUGIN_NAME } from './config.js'
 import { canonicalCwd } from './paths.js'
 
 /** SessionId 品牌转换: 宿主实现同样只是编译期 cast, 运行时原样返回字符串 */
@@ -33,14 +32,17 @@ function deepFreeze<T>(value: T): T {
   return value
 }
 
-/** 等价 dsh-llm 的 createUserMessage: {id, role:'user', content, source} 深冻结的 user 消息(纯数据, 无宿主符号) */
+/** 等价 dsh-llm 的 createUserMessage: {id, role:'user', content, source} 深冻结的 user 消息(纯数据, 无宿主符号)。
+ * source 用规范 user kind——0.1.7 起共享 plugin kind 已从 MessageSourceMap 移除(各生产者自声明 kind),
+ * user 消息上的未知 kind 运行时虽被透传, 但已脱契约, 溯源标注也会退化。
+ * id 是宿主品牌类型(MessageId), 纯数据构造经 unknown 转换。 */
 export function userMessage(text: string): UserMessage {
   return deepFreeze({
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: PLUGIN_NAME },
-  }) as UserMessage
+    source: { kind: 'user' },
+  }) as unknown as UserMessage
 }
 
 /** 读取会话事件快照: 优先公开 API snapshotEvents()(0.1.5+), 回退旧版运行时同形的 log 字段 */

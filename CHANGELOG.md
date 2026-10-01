@@ -5,6 +5,148 @@
 > 0.5.0 之后的全部工作（尚未发布）。以下按开发批次（先后顺序）组织，
 > **时间倒序**排列（批次 1 的完整条目在本节末尾）。
 
+### 批次 26: 执行桥接语义修正（锁统一/失败透出/取消语义/幂等/续接目录与 preset）
+
+对照外部评审逐条核实后修掉的一批执行桥接层缺陷；分支分配、验收与合并等项目决策仍归主会话。
+
+- **统一 cwd 串行锁（原双锁漏洞）**：此前按目录调用锁 cwd、按 `sessionId` 调用锁 `session:`——
+  两种入口可能命中同一 agent 却持有不同锁，并发 followup 同一会话。现在 `executeTask` 先经
+  `sessionCwdOf()`（池记录 → live header → 持久化 header）解析会话权威目录，一切任务统一锁
+  "实际执行目录"；同一会话的所有入口必然同锁串行。
+- **续接目录一致性校验（防跨工作树误执行）**：按 `sessionId` 续接时，会话自身目录是权威执行
+  目录——缺省 `cwd` 沿用会话目录（此前缺省会落 `process.cwd()`，白名单部署下还可能被误拒）；
+  显式传入的 `cwd` 与会话目录不一致时明确拒绝（`agent_run` / `task_inbox` 同语义，
+  `task_inbox` 省略 cwd 时在提交时即解析会话目录入队）。白名单校验（`sessionCwdRefusal`）
+  先于一致性校验，拒绝语义与接管面一致。
+- **队列失败透出**：turn 失败（`result.error` 非空）的队列任务终态从 `done` 改标 `error`
+  （`item.error` 同步回填）——只轮询状态（`detail=status` 只回 `item.error`）的调用方不再漏报
+  执行失败；结果本体仍保留可照常取回。取消优先于失败判定（abort 收场仍是 `cancelled`）。
+- **取消语义区分"正在取消"与"确认停止"**：`task_cancel` 对执行中任务送达官方 `agent.cancel`
+  后返回 `cancelling: true`，状态保持 `running` 直到 turn 真正收敛才翻转 `cancelled`（此前
+  abort 即标 `cancelled`，调度方据此释放槽位会与仍在跑的 agent 竞争）；窗口期内 `task_list`
+  / `dsh://queue/{taskId}` 带 `cancelRequested` 标记。排队中任务取消仍是立即终态。
+- **续接幂等键**：`task_inbox` 新增可选 `idempotencyKey`——相同键的重复提交返回原任务
+  （`deduplicated: true`）不重复执行（响应丢失重试场景）；键在任务保留期内有效，强制重跑换新键。
+- **resume 恢复会话原 preset**：持久化 resume 此前一律挂部署默认 preset——依赖特定人格/工具集
+  的工作会话续接时被静默换掉执行环境。现在从会话 header 的 `agentPreset` 恢复原 preset（旧会话
+  无记录时回落部署默认；原 preset 已不在花名册时回落并告警），结果里如实回报实际挂载值。
+- **blocked 收场指引**：turn/end `blocked`（宿主等交互式审批/输入）的 error 信息附可执行的
+  下一步（安排宿主侧审批或放宽审批策略后用同一 `sessionId` 续接）；帮助文档的 Approval policy
+  节同步改写（不再只说"会失败关闭"）。
+- **完成结果默认保留 24 小时**（原 10 分钟，`taskTtlMs`）：提交后隔一段时间回来审核/游戏测试
+  仍可取回。队列持久化默认仍关闭（无 `queuePersistKey` 时任务载荷明文落盘，不宜默认开启），
+  配置注释与文档改为明确建议无人值守部署启用（搭配加密 key）。
+
+第二轮评审复现后补修的三处（测试先行，均以实际工具返回/执行计数断言）：
+
+- **幂等去重的并发缺口**：查重与入队之间隔着目录校验的 `await`，并发同键请求会一起穿过查重
+  各自入队（同一工作执行两遍）。目录解析/白名单校验前置，"查重 → 容量 → 入队"收进同一同步块
+  （JS 单线程下无 await 即无交错）。smoke 用 `Promise.all` 并发同键提交，以 followup 计数
+  断言"只执行一次"（harness 新增 followup 记录，不只看新建会话数）。
+- **会话初始化期间的取消丢失**：外部取消监听原在 `getAgent()` 之后注册，而 AbortSignal 对
+  注册前已发生的 abort 不补发事件——初始化窗口内的取消被吞掉，followup 照发、cancel 零调用。
+  监听先于 `getAgent` 注册（与超时门禁同一 abort 合流），取得会话后、投递任务前再查一次：
+  已取消则不投递、resume 独占句柄照常释放，结果按取消收场但带 sessionId 供续接。smoke 用
+  create 闸门（可控 Promise）拉长初始化窗口确定性复现。
+- **cancelRequested 未透出到工具面**：数据层有标记但 `task_list` 的 outputSchema（zod 对未声明
+  字段静默剥离）与 `task_result` 轻量轮询都没有它。schema 显式声明 + 轮询载荷补齐，判定收拢为
+  `cancelRequestedOf()`（task_list/task_result/资源面同一来源）。smoke 在取消窗口期内断言
+  工具返回值（非数据层内部）。
+- **取消监听的清理收口（评审复核建议）**：外部取消监听提前注册后，getAgent 抛错（如 resume
+  失败）或取消前收场的提前 return 会绕过原有摘除点，把监听残留在调用方 signal 上。初始化失败
+  与取消前收场两条路径都先摘监听再上抛/返回；smoke 以 `getEventListeners` 直接数调用方 signal
+  上的 abort 监听（执行中恰 1 个、getAgent 抛错后为 0），回退探针确认禁用清理即红。
+
+### 批次 25: MCP resources 全面利用（数据面/订阅/补全/标注 + resourceFirst 形态）
+
+对照 [MCP 2026-07-28 Resources 规范](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
+把资源面从"5 个工具镜像"扩成**数据面本体**。SDK 1.30.0 事实先行核查：协议最高协商 `2025-11-25`
+（2026-07-28 新的 `subscriptions/listen` 机制不可用，落地的是 `resources/subscribe` + `notifications/resources/updated`
+旧语义）；`registerResource` 已自动声明 `listChanged` 但插件从未发过通知；`ResourceTemplate` 的
+`{?query}` 匹配是必选语义（不可选参数化 → 路径游标设计）；每连接一个 `McpServer` 实例的架构让
+订阅按连接隔离天然成立。
+
+- **数据层抽取（`src/data.ts`）**：读实现从 tools.ts 拆出，工具面与资源面共享（同白名单边界、同投影），
+  并承载资源 URI 构造器 `resUri`（唯一出处）。新增载荷：单任务全量（`dsh://queue/{taskId}`，完成含
+  full 投影）、常驻池明细（`dsh://agents`，工具面没有的能力）、preset 花名册（`dsh://presets`——
+  `agent_run` 的 preset 参数此前无从查证）、工作区清单/明细、会话元数据（`dsh://sessions/{id}`，
+  persisted-only 可读 + `historyReadable` 指路）、活动窗口（`dsh://sessions/{id}/activity`）、
+  原始事件流（`dsh://sessions/{id}/events`，JSONL + after 游标，500 行上限）、宿主工具注册表
+  （`dsh://tools`）。资源全景：24 静态 + 9 模板（guide 分节/status 三细分/history·events 游标变体）。
+- **订阅枢纽（`src/notify.ts`）**：自管订阅登记（SDK 不做）+ 定向推送。`updated(uri)` 立即推给订阅
+  该 URI 的连接（任务状态迁移/turn 收敛历史刷新），`updatedThrottled` 尾沿节流（activity，
+  间隔 = `progressIntervalMs`，无人订阅零开销），`listChanged()` ~100ms 合并广播（清单成员变化）。
+  发送失败静默（客户端没开 GET SSE 流是 StreamableHTTP 正常态）。
+- **通知源接线**：队列 runner 的 onStart/onSession/finally（queued→running→认领会话→终态，每次迁移
+  都推——`updated` 只是"重读"信号，终态以资源内容为准）、task_inbox/task_cancel、engine 的 turn
+  启动/心跳/收敛与入池/rekey、rename/attach/select_model 的清单变化。真机 E2E 教训直接进了资源
+  描述：快任务可能在订阅落地前已完成（届时直接读取即得终态）。
+- **规范语义落地**：`resources/subscribe` 注册（校验 = 试读：不可读目标 -32602 拒绝）；读错误一律
+  `McpError(-32602)` 带原因与替代路径（绝不空 `contents`）；listed ⇒ readable——history/events/
+  activity 模板清单只列 live 会话；`completion/complete`（sessionId 按 live/persisted 分模板、taskId、
+  provider）；资源带 `annotations`（audience/priority/lastModified 在可得处下发）。
+- **HATEOAS 引用（两种形态都下发）**：`task_inbox`/`task_result` 返回 `dsh://queue/{taskId}`，
+  `agent_run` 返回 `dsh://sessions/{id}/history`——资源型客户端按 URI 直读/订阅。
+- **`resourceFirst` 配置（默认 false）**：资源优先部署形态——九个只读工具下线（dsh_get_started/
+  dsh_list_tools/dsh_status/model_list/workspace_list/task_list/task_result/session_list/
+  session_history），`agent_run` 默认新 `uri` 档（只回引用，`detail=summary|normal|full` 逃生门），
+  initialize instructions 换资源面指路变体。对不知 resources 的客户端零行为变化。
+- **验证**：smoke 193 → **230 项全绿**（新增资源面全集/读语义/翻页游标/补全/订阅推送与退订/
+  订阅观测/resourceFirst 形态等断言；SSE 流真开真收）；真机 E2E（0.2.0-rc.2 隔离 DSH_HOME）
+  零 token 相 **20/20** + agent 相 **E2E PASS**——完整资源路径一枪过：`task_inbox` → 订阅
+  `dsh://queue/{taskId}` → 0.2s 首推（running）→ 32.8s 终态推送 → 读资源拿 full 结果（pwsh×2、
+  summary 合同）→ 纪要资源读到 8 个真实轮次，详见 [docs/e2e-resources.zh.md](./docs/e2e-resources.zh.md)。
+
+### 批次 24: 适配 dsh 0.2.0-rc.2（latest/next 双标签）
+
+0.1.7-rc.2 → **0.2.0-rc.2**（2026-09-29 发布，已同时挂 `latest` 与 `next`）。**源码零改动**——
+0.1.7 迁移建立的兼容层（`{kind:'user'}` source、usage 双形状读取、preset-registry 导入）天然覆盖
+0.2.0，本轮仅 devDeps 类型同步 + 验证 + 文档：
+
+- **devDeps**：`@deepseek-ai/dsh-*` 与 cordis 全部对齐 0.2.0-rc.2（cordis 主链仍 ~4.0.4）；
+  上一轮的 presets 更名（`dsh-agent-preset-registry`）在 0.2.0 延续，包与服务签名未再变。
+- **类型面 diff 全部无变化**：`Agent` 五方法、`SessionStore` 三方法、`snapshotEvents()`、
+  `tools.schemas()`、`MessageSourceMap`、`TextBlock`、`assistant/message` / `tool/call` /
+  `tool/result` / `turn/end` 载荷、preset `mount(ctx, id?)` + `AgentPreset.id`。加法项：
+  `assistant/message` 新增 `interrupted?: true`；TurnEndReason 新增 `interrupted` / `forked`
+  收场——插件的"非 completed 透出"逻辑天然覆盖。无类型视图的宿主服务
+  （`agentDefaultModel` / `sessionTitle` / `workspaceRegistry` / `sessionPersistence`）与注入目标
+  `dsh-client-ui-settings` 在完整 0.2.0 宿主里核对均在。
+- **真机 E2E（0.2.0-rc.2，DSH_HOME 隔离 home）**：零 token 相 14/14 全绿；agent 相 E2E PASS
+  （22.5s，pwsh×2，心跳 5 次，session_list/session_history 全过）。
+  环境发现：以 `D:\Workspace\...` 实目录为 cwd 时沙箱 `grantWrite` ACL 报错（0.1.7 同现，与版本
+  无关），0.2.0 模型会经 `diagnose-windows-sandbox-acl` 技能尝试越权诊断 → 挂审批无人应答而
+  静止；Temp 目录为 cwd 则一切正常。E2E 的 agent 相固定 Temp cwd，详见
+  [docs/e2e-0.2.0-rc.2.zh.md](./docs/e2e-0.2.0-rc.2.zh.md)。
+
+### 批次 23: 适配 dsh 0.1.7-rc.2（npm 最新非 alpha）
+
+目标版本从 0.1.5-rc.2 迁移到 **0.1.7-rc.2**（`next` 标签，`latest` 标签仍为 0.1.5-rc.3；
+0.1.6 只出过 alpha）。运行时零依赖设计再次生效——宿主服务面几乎原样，真机 E2E 通过：
+
+- **devDeps 类型同步**：`@deepseek-ai/dsh-*` 0.1.5-rc.2 → 0.1.7-rc.2，cordis 4.0.2 → 4.0.4；
+  **presets 包更名**——`@deepseek-ai/dsh-agent-presets` 不再发布，`ctx.agentPresets` 服务由
+  `@deepseek-ai/dsh-agent-preset-registry` 提供（`mount(ctx, id?)` 签名不变、roster 条目仍有
+  `id`），声明合并导入换包即可，运行时零改动。
+- **`userMessage()` source 规范化**：0.1.7 把共享 `plugin` kind 从 `MessageSourceMap` 移除
+  （"no shared catch-all plugin kind"；user 消息携带任意生产者 kind、未知 kind 运行时透传）。
+  自造消息从 `{kind:'plugin', plugin: PLUGIN_NAME}` 改为 `{kind:'user'}`——运行时原本也容忍，
+  但旧值已脱契约、溯源标注会退化。`MessageId` 品牌化后构造经 `unknown` 转换（编译期）。
+- **usage 双形状读取**：0.1.7 的 `assistant/message` 把 `TokenUsage` 挪到事件载荷（不再随
+  `message`）；结果聚合改为事件载荷优先、`message.usage` 兜底（旧宿主不受影响）。smoke 假宿主
+  改发两条 assistant/message（事件级 + message 级各一），聚合断言值不变（120/45/165）验证双形状。
+- **e2e 探针修复**：`task_list` 断言适配 `{tasks:[...]}` 包装（批次 21 引入结构化输出时漏改）；
+  `parsePayload` 优先取带 `result`/`error` 的 SSE 行——agent_run 流里 progress 心跳先于响应到，
+  原实现取到通知行导致 agent 相崩溃。
+- **源码级兼容性核对**（0.1.5-rc.2 vs 0.1.7-rc.2 类型 diff）：`Agent` 五方法、
+  `AgentRegistry.create/resume`、`SessionStore.get/list/flush`、`tools.schemas()`、五个消费事件名、
+  `TextBlock`、`snapshotEvents()`、注入目标 `dsh-client-ui-settings` 均未变；`agent/session-start`
+  签名有变但插件未监听。
+- **真机 E2E（0.1.7-rc.2，DSH_HOME 隔离 home，不触碰常驻 0.1.5 数据）**：零 token 相 14/14 全绿；
+  agent 相首轮 turn 完整成功（preset 挂载过 0.1.7 presets 重构、新 source 被 agent-loop 接受、
+  事件提取与总结契约全过）；两处环境相关发现（0.1.7 沙箱 ACL 报错由模型自行降级绕过、升级重试
+  疑似触发 approval 等待）见 [docs/e2e-0.1.7-rc.2.zh.md](./docs/e2e-0.1.7-rc.2.zh.md)。
+
 ### 批次 22: session_history 支持 roles 按轮次类型过滤
 
 - **`session_history` 新增 `roles` 参数**：调用方自行决定查看哪些轮次类型

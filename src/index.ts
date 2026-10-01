@@ -7,13 +7,16 @@
  * 模块布局(职责单一, 依赖自上而下无环):
  *   config     配置接口与默认值
  *   types      跨模块纯数据类型
- *   state      进程内可变状态(config/池/锁/队列/hooks)
+ *   state      进程内可变状态(config/池/锁/队列/hooks/通知钩子)
  *   paths      cwd 规范化与 workspaceRoots 白名单(安全边界)
  *   persist    队列持久化静态加密(AES-256-GCM)
  *   projection 结果投影(token 预算)与会话纪要投影
  *   host       宿主服务桥接(零宿主副本原则) + 工作区归组/会话查找
  *   engine     执行引擎(模型解析/会话池/三级接管/取消/进度/结构化结果)
- *   tools      17 个 MCP 工具注册与模型目录 + 5 个只读资源(status/queue/sessions/history/guide)
+ *   data       数据层: 工具面与资源面共享的读实现(同白名单边界) + 资源 URI 构造器
+ *   notify     资源订阅枢纽(per-connection 订阅登记/updated 定向推送/list_changed 合并广播)
+ *   tools      17 个 MCP 工具注册与模型目录(resourceFirst 形态下只读面 9 个下线)
+ *   resources  资源面: 全量只读 URI + resources/subscribe + completion + annotations
  *   onboarding initialize 的 instructions 引导 + dsh_get_started 帮助文档(agent 认知面)
  *
  * 工具集: echo / dsh_list_tools / dsh_status / workspace_list / model_list / agent_run /
@@ -45,8 +48,11 @@ import { state } from './state.js'
 import { canonicalCwd } from './paths.js'
 import { decryptQueuePayload, encryptQueuePayload, PERSIST_MAGIC } from './persist.js'
 import { executeTask, selectionOverrideOf } from './engine.js'
-import { registerResources, registerTools } from './tools.js'
-import { SERVER_INSTRUCTIONS } from './onboarding.js'
+import { registerTools } from './tools.js'
+import { registerResources } from './resources.js'
+import { resUri } from './data.js'
+import { createNotifyHub } from './notify.js'
+import { serverInstructions } from './onboarding.js'
 import { reattachOrphanSessions } from './host.js'
 import type { TaskItem } from './types.js'
 
@@ -189,7 +195,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     queuePersistPath: config.queuePersistPath ? resolve(config.queuePersistPath) : DEFAULTS.queuePersistPath,
     queuePersistKey: config.queuePersistKey ?? DEFAULTS.queuePersistKey,
     defaultDetail: config.defaultDetail ?? DEFAULTS.defaultDetail,
+    resourceFirst: config.resourceFirst ?? DEFAULTS.resourceFirst,
   }
+
+  // ── 资源订阅枢纽: 每连接一个 McpServer 实例的架构让订阅按连接隔离; 变更点经 state.hooks 汇入 ──
+  const hub = createNotifyHub({ activityThrottleMs: Math.max(250, state.config.progressIntervalMs) })
+  state.hooks.notifyTaskChanged = (taskId) => hub.updated(resUri.queueTask(taskId))
+  state.hooks.notifySessionActivity = (sessionId) => hub.updatedThrottled(resUri.sessionActivity(sessionId))
+  state.hooks.notifySessionHistory = (sessionId) => hub.updated(resUri.sessionHistory(sessionId))
+  state.hooks.notifyListChanged = () => hub.listChanged()
 
   // ── 任务队列持久化(可选): 队列变化串行落盘(最后写入胜出), apply 时恢复 ──
   const persistPath = state.config.queuePersistPath
@@ -218,7 +232,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     void (async () => {
       try {
         // 排队期间已被取消: 不再投递给 agent, 直接收敛(cancel 已由 task_cancel 完成)
-        if (item.controller?.signal.aborted) return
+        if (item.controller?.signal.aborted) {
+          item.status = 'cancelled'
+          return
+        }
         item.result = await executeTask({
           ctx,
           task: item.task,
@@ -230,20 +247,35 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           preset: item.preset,
           signal: item.controller?.signal,
           // running 只在真正拿到 cwd/session 锁开始执行时才标记(排队含锁内等待, 持久化快照才不失真)
-          onStart: () => { item.status = 'running'; persistQueue() },
+          onStart: () => { item.status = 'running'; persistQueue(); state.hooks.notifyTaskChanged(item.id) },
           // 拿到会话即回填(池新建的会话请求参数里没有): 运行中就能被 agent_steer 按 taskId 定位
-          onSession: (sid) => { if (!item.sessionId) { item.sessionId = sid; persistQueue() } },
+          onSession: (sid) => {
+            if (!item.sessionId) { item.sessionId = sid; persistQueue() }
+            state.hooks.notifyTaskChanged(item.id)
+          },
         })
         item.result.taskId = item.id
         // 回填实际执行的会话(新建池会话时请求参数里没有), task_list/重启后续接都靠它
         if (!item.sessionId && item.result.sessionId) item.sessionId = item.result.sessionId
-        item.status = item.controller?.signal.aborted ? 'cancelled' : 'done'
+        // 终态判定: 取消优先于失败(abort 收场的 turn/end 是 canceled, 不是执行失败);
+        // turn 失败(result.error)的任务标 error 而非 done——只轮询状态(detail=status 只回 item.error)
+        // 的调用方也能看到失败, 结果本体仍保留在 item.result 可照常取回。
+        if (item.controller?.signal.aborted) {
+          item.status = 'cancelled'
+        } else if (item.result.error) {
+          item.status = 'error'
+          item.error = item.result.error
+        } else {
+          item.status = 'done'
+        }
       } catch (e) {
         item.error = String(e)
         item.status = item.controller?.signal.aborted ? 'cancelled' : 'error'
       } finally {
         item.finishedAt = Date.now()
         persistQueue()
+        // 终态迁移: 订阅 dsh://queue/{taskId} 的客户端在此收到完成/失败推送(免轮询的核心路径)
+        state.hooks.notifyTaskChanged(item.id)
       }
     })()
   }
@@ -334,6 +366,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       state.sessionToPoolKey.clear()
       state.agentLocks.clear()
       state.taskQueue.clear()
+      hub.dispose()
     }
   }, PLUGIN_NAME)
 
@@ -359,6 +392,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         // close 正常会触发 onclose 清理映射; 这里兜底防泄漏
         if (transports.has(sid)) {
           transports.delete(sid)
+          const mcp = servers.get(sid)
+          if (mcp) hub.unbind(mcp)
           servers.delete(sid)
           connections.delete(sid)
         }
@@ -427,6 +462,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         liveAgents: state.liveAgents.size,
         queue: { active: queueActive, done: queueDone, error: queueError, cancelled: queueCancelled },
         connections: connections.size,
+        // 资源订阅面观测: 绑定连接数 / 订阅总数(跨连接)
+        subscriptions: hub.stats(),
       },
       connections: Array.from(connections.values(), (c) => ({ ...c })),
     }
@@ -584,16 +621,22 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
       // instructions 随 initialize result 下发: agent 在拿到工具清单前先读到整体工作流引导
-      const mcp = new McpServer({ name, version: PLUGIN_VERSION }, { instructions: SERVER_INSTRUCTIONS })
+      // resources 能力显式声明(subscribe 由本插件自管登记; listChanged 由 hub 合并广播)
+      const mcp = new McpServer({ name, version: PLUGIN_VERSION }, {
+        // resourceFirst 部署的引导文本指路资源面; 普通部署指路工具
+        instructions: serverInstructions(state.config.resourceFirst),
+        capabilities: { resources: { listChanged: true, subscribe: true } },
+      })
       registerTools(mcp, ctx, { statusSnapshot })
-      registerResources(mcp, ctx, { statusSnapshot })
+      registerResources(mcp, ctx, { statusSnapshot, hub })
       const initUserAgent = String(req.headers['user-agent'] ?? '')
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           transports.set(sid, transport)
           servers.set(sid, mcp)
-          // 连接登记: 首个 initialize 请求的 User-Agent 即客户端身份
+          // 连接登记: 首个 initialize 请求的 User-Agent 即客户端身份; 订阅枢纽自此收发
+          hub.bind(mcp)
           connections.set(sid, {
             sessionId: sid,
             connectedAt: Date.now(),
@@ -605,6 +648,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       })
       // 会话关闭时清理映射(避免临时 key 泄漏 + 无效会话累积)
       transport.onclose = () => {
+        hub.unbind(mcp)
         const sid = transport.sessionId
         if (sid) {
           transports.delete(sid)

@@ -1,6 +1,7 @@
 /**
  * 执行引擎: 模型选择解析、常驻会话池(cwd + 模型三元组, LRU 淘汰跳过活跃会话)、
- * sessionId 三级接管(本进程池 → live 会话 → 持久化 resume)、cwd/session 串行锁、
+ * sessionId 三级接管(本进程池 → live 会话 → 持久化 resume)、统一 cwd 串行锁
+ * (按目录与按会话两种入口都锁"实际执行目录", 同一会话的所有入口同锁串行)、
  * MCP 规范原生的取消(notifications/cancelled → 官方 agent.cancel)与进度(_meta.progressToken →
  * notifications/progress)、任务执行与结构化结果读取。
  */
@@ -157,6 +158,24 @@ function poolKey(cwd: string, selection: ModelSelection, preset: string): string
   return [cwd, selection.provider, selection.model, selection.reasoningEffort ?? '', preset].join('\u0000')
 }
 
+/**
+ * 接管前定位会话 cwd(池记录 → live header → 持久化 header): 池记录的 cwd 建会话时已 realpath 规范化,
+ * live/持久化侧现规范化。找不到(会话不存在)返回 undefined, 由接管路径给出"session not found"。
+ * 用途: executeTask 的统一 cwd 锁与"显式 cwd 必须与会话目录一致"校验(不必等拿锁后接管才发现)。
+ */
+export async function sessionCwdOf(ctx: Context, sessionId: string): Promise<string | undefined> {
+  const poolKeyOfSession = state.sessionToPoolKey.get(sessionId)
+  const pooled = poolKeyOfSession !== undefined ? state.liveAgents.get(poolKeyOfSession) : undefined
+  if (pooled) return pooled.cwd
+  const live = ctx.agents.get(asSessionId(sessionId))
+  if (live) {
+    const cwd = (live as { session?: { header?: { cwd?: string } } }).session?.header?.cwd
+    return cwd === undefined ? undefined : canonicalCwd(cwd)
+  }
+  const header = await findSessionHeader(ctx, asSessionId(sessionId))
+  return header?.cwd === undefined ? undefined : canonicalCwd(header.cwd)
+}
+
 /** getAgent 的返回: handle 恒有 .agent; resume 出来的独占句柄带 disposeAfter 标记, 任务结束后应 flush+dispose */
 interface ResolvedAgent {
   sessionId: SessionId
@@ -217,6 +236,8 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
   const rec: PooledAgent = { sessionId: newSessionId, handle, cwd, selection, preset: presetName }
   state.liveAgents.set(key, rec)
   state.sessionToPoolKey.set(String(newSessionId), key)
+  // 新会话入池: sessions/agents 清单成员变化 → 资源面 list_changed(hub 侧合并广播)
+  state.hooks.notifyListChanged()
 
   // 分组: 把会话归属到 cwd 对应的工作区(resolveByPath ?? create + attachSession; 可选依赖; headless 环境自动跳过)
   void (async () => {
@@ -310,23 +331,34 @@ async function takeoverSession(ctx: Context, sessionId: string, override?: Model
     return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false, selection: selectionOfAgent(live), preset: '' }
   }
   // live 也没有: 从持久化会话存储 resume 并接管(进程重启前的会话、LRU 淘汰后被释放的会话)
-  // header 查不到时跳过校验, 让 resume 用自己的"session not found"报错
-  if (whitelistActive) {
-    const header = await findSessionHeader(ctx, sid)
-    if (header !== undefined) {
-      const refusal = await sessionCwdRefusal(sessionId, header.cwd)
-      if (refusal) throw new Error(refusal)
-    }
+  // header 预读(无条件): 白名单校验 + 恢复原 preset 都需要; 查不到时跳过校验, 让 resume 用自己的"session not found"报错
+  const header = await findSessionHeader(ctx, sid)
+  if (whitelistActive && header !== undefined) {
+    const refusal = await sessionCwdRefusal(sessionId, header.cwd)
+    if (refusal) throw new Error(refusal)
   }
   // resume 会重建 agent, 所以这里必须现算一份完整模型选择(agent.options.model 是 {{model}} 变量的来源)
   const selection = resolveAgentOptions(ctx, override)
+  // resume 沿用会话原 preset(header.agentPreset; 旧会话/未记录时回落部署默认)——重建不换人格,
+  // 否则依赖特定人格/工具集的工作会话在续接时被静默换掉执行环境。
+  // 原 preset 已不在花名册时回落部署默认并告警(结果里如实回报实际挂载的 preset)。
+  const originalPreset = header?.agentPreset
+  let mountedPreset = state.config.preset
   let handle: AgentHandle
   try {
     handle = await ctx.agents.resume({
       resumeSessionId: sid,
       agentOptions: agentOptionsOf(selection),
       setup: async (agentCtx) => {
-        // resume 沿用部署默认 preset(接管已有会话不换人格; per-call preset 只对新建会话生效)
+        if (originalPreset && originalPreset !== state.config.preset) {
+          try {
+            await mountPreset(ctx, agentCtx, originalPreset)
+            mountedPreset = originalPreset
+            return
+          } catch (e) {
+            console.warn(`[dsh-carrot-on-a-stick] resume: original preset "${originalPreset}" mount failed, falling back to "${state.config.preset}":`, String(e))
+          }
+        }
         await mountPreset(ctx, agentCtx, state.config.preset)
       },
     })
@@ -335,7 +367,7 @@ async function takeoverSession(ctx: Context, sessionId: string, override?: Model
     throw new Error(`session not found for resume: ${sessionId} (not live and not persisted; ${(e as Error)?.message ?? e})`)
   }
   await attachSessionCwd(ctx, sid, handle.agent.session.header.cwd)
-  return { sessionId: sid, handle, disposeAfter: true, selection, preset: state.config.preset }
+  return { sessionId: sid, handle, disposeAfter: true, selection, preset: mountedPreset }
 }
 
 /** 同一 cwd 串行执行, 避免并发 followup 同一会话; 链尾落定且无新等待者时清理 key(防长进程下 Map 无限增长) */
@@ -381,7 +413,8 @@ export interface ExecuteTaskOptions {
   ctx: Context
   task: string
   context: string
-  cwd: string
+  /** 工作目录(缺省: 无 sessionId = 进程 cwd; 续接会话 = 沿用会话自身目录, 显式传入时必须与会话目录一致) */
+  cwd?: string
   resumeSessionId?: string
   title?: string
   override?: ModelSelectionOverride
@@ -400,23 +433,76 @@ export interface ExecuteTaskOptions {
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果; signal 中止时走官方 cancel */
 export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult> {
   const { ctx, task, context, cwd, resumeSessionId, title, override, preset, signal, onStart, onSession, reportProgress } = opts
-  const workdir = await canonicalizeAllowedCwd(cwd)
+  // 执行目录解析: 无 sessionId 时规范化+白名单校验调用方 cwd(缺省进程 cwd); 有 sessionId 时
+  // 会话自身 cwd 是权威执行目录——显式传 cwd 必须与会话目录一致(防"以为在 A 树、实际在 B 树执行"),
+  // 缺省沿用会话目录。目录统一后, 按目录与按会话两种入口落到同一把 cwd 锁(统一互斥)。
+  let workdir: string
+  if (resumeSessionId) {
+    const sessionCwd = await sessionCwdOf(ctx, resumeSessionId)
+    if (sessionCwd !== undefined) {
+      // 白名单边界先行(与接管面同款拒绝语义; 接管面内还有同级校验兜底), 再做一致性校验
+      if (state.config.workspaceRoots.length > 0) {
+        const refusal = await sessionCwdRefusal(resumeSessionId, sessionCwd)
+        if (refusal) throw new Error(refusal)
+      }
+      if (cwd !== undefined) {
+        const requested = await canonicalCwd(cwd)
+        if (requested !== sessionCwd) {
+          throw new Error(`session ${resumeSessionId} lives in ${sessionCwd}, not the requested cwd ${requested}; `
+            + `pass the session's own cwd (see session_list) or omit cwd to follow the session`)
+        }
+      }
+      workdir = sessionCwd
+    } else {
+      // 会话定位不到(不存在/刚被清理): 用调用方 cwd 走接管路径, 由 takeover 给出 not found
+      workdir = await canonicalizeAllowedCwd(cwd)
+    }
+  } else {
+    workdir = await canonicalizeAllowedCwd(cwd)
+  }
   // per-call preset 在拿锁前解析(门禁/roster 校验快速失败, 不占排队位); 接管已有会话时忽略(沿用原 preset)
   const presetName = resumeSessionId ? undefined : await resolvePreset(ctx, preset)
-  // sessionId 用 session 锁, 否则用 cwd 锁——都防同一 agent 会话被并发 followup
-  const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
-  return withLock(lockKey, async () => {
+  // 统一互斥: 一切任务都锁"实际执行目录"——同一会话的所有入口(按目录池命中/按 sessionId 接管)
+  // 必然解析出同一 workdir, 因此同锁串行; 不再有"目录锁 + 会话锁"两套互斥各管半边的问题
+  return withLock(workdir, async () => {
     // 排队期间已被取消(task_cancel abort): 不投递给 agent, 直接以取消收场
     if (signal?.aborted) {
       return { taskId: '', sessionId: '', model: { provider: '', model: '' }, preset: '', durationMs: 0, assistantText: '', toolCalls: [], toolResults: [], changes: '', verification: '', leftovers: '', error: 'cancelled before start' }
     }
-    onStart?.()
-    const { sessionId, handle, disposeAfter, selection, preset: mountedPreset } = await getAgent(ctx, workdir, resumeSessionId, title, override, presetName)
+    // 外部取消与超时先合流到同一 abort: 监听必须先于 getAgent 注册——AbortSignal 对注册前
+    // 已发生的 abort 不补发事件, 晚注册会漏掉"会话初始化期间"的取消(followup 照发、cancel 零调用)
+    let timedOut = false
+    let cancelCause: unknown = { kind: 'user' }
+    const timeoutAbort = new AbortController()
+    const onOuterAbort = () => timeoutAbort.abort()
+    signal?.addEventListener('abort', onOuterAbort, { once: true })
+    let claimed: ResolvedAgent
+    try {
+      onStart?.()
+      claimed = await getAgent(ctx, workdir, resumeSessionId, title, override, presetName)
+    } catch (e) {
+      // 初始化失败(resume 失败/宿主异常): 先摘除取消监听再上抛——不把监听残留在调用方 signal 上
+      signal?.removeEventListener('abort', onOuterAbort)
+      throw e
+    }
+    const { sessionId, handle, disposeAfter, selection, preset: mountedPreset } = claimed
     onSession?.(String(sessionId))
+    // 会话初始化(await getAgent: 池新建/resume 可能耗时)期间可能已取消: 取得会话后、投递任务前
+    // 再查一次——不投递、不开无人接管的 turn; resume 的独占句柄照常释放, 结果按取消收场但带
+    // sessionId(调用方仍可续接这个空闲会话)
+    if (signal?.aborted) {
+      signal?.removeEventListener('abort', onOuterAbort)
+      if (disposeAfter) {
+        try { await handle.dispose() } catch { /* 释放失败不影响结果 */ }
+      }
+      return { taskId: '', sessionId, model: selection, preset: mountedPreset, durationMs: 0, assistantText: '', toolCalls: [], toolResults: [], changes: '', verification: '', leftovers: '', error: 'cancelled before start (session claimed, task not delivered)' }
+    }
     // 事件基线: 只读本轮新增事件(公开 API snapshotEvents; 旧宿主回退 log 字段)
     const baseline = eventsOf(handle.agent.session).length
     // 标记活跃: 池 LRU 淘汰据此跳过本会话(不能 dispose 一个正在跑 turn 的会话)
     state.activeTurnSessions.add(String(sessionId))
+    // 资源面: 活动窗口(dsh://sessions/{id}/activity)立即反映"已启动"
+    state.hooks.notifySessionActivity(String(sessionId))
     // 立即回报一次"已启动"(0 事件), 让调用方的进度 UI 无需等第一个心跳间隔
     const progressInfo = (): { events: number; turns: number; lastTool: string } => {
       const events = eventsOf(handle.agent.session).slice(baseline)
@@ -443,13 +529,8 @@ export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult>
     // turn 墙钟起点: 从投递任务起算(含组装后的投递排队), 收敛后差值进结果
     const turnStartedAt = Date.now()
     handle.agent.followup(userMessage(fullTask))
-    // 超时门禁(taskTimeoutMs=0 关闭): 到点以 hook 原因走官方 cancel, 与外部取消信号合流到同一 abort
+    // 超时门禁(taskTimeoutMs=0 关闭): 到点以 hook 原因走官方 cancel(与上方已合流的外部取消同一 abort)
     const taskTimeoutMs = state.config.taskTimeoutMs
-    let timedOut = false
-    let cancelCause: unknown = { kind: 'user' }
-    const timeoutAbort = new AbortController()
-    const onOuterAbort = () => timeoutAbort.abort()
-    signal?.addEventListener('abort', onOuterAbort, { once: true })
     const timeoutTimer = taskTimeoutMs > 0
       ? setTimeout(() => {
         timedOut = true
@@ -457,15 +538,14 @@ export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult>
         timeoutAbort.abort()
       }, taskTimeoutMs)
       : undefined
-    // 进度心跳(可选, 调用方在 _meta.progressToken 请求时才激活): 定期回报 turn 观测摘要
-    let progressTimer: ReturnType<typeof setInterval> | undefined
-    if (reportProgress) {
-      progressTimer = setInterval(() => {
-        try {
-          void Promise.resolve(reportProgress(progressInfo())).catch(() => { /* 单次心跳失败不影响任务 */ })
-        } catch { /* 忽略单次心跳失败 */ }
-      }, state.config.progressIntervalMs)
-    }
+    // 进度心跳: 调用方在 _meta.progressToken 请求了进度则定期回报 turn 观测摘要;
+    // 同时(无条件)驱动资源面的活动窗口订阅推送(hub 侧节流+无人订阅时零开销)
+    const progressTimer = setInterval(() => {
+      try {
+        if (reportProgress) void Promise.resolve(reportProgress(progressInfo())).catch(() => { /* 单次心跳失败不影响任务 */ })
+        state.hooks.notifySessionActivity(String(sessionId))
+      } catch { /* 忽略单次心跳失败 */ }
+    }, state.config.progressIntervalMs)
     try {
       await awaitIdleCancellable(handle.agent, handle.agent.whenIdle(), timeoutAbort.signal, () => cancelCause)
     } finally {
@@ -473,6 +553,9 @@ export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult>
       if (progressTimer) clearInterval(progressTimer)
       signal?.removeEventListener('abort', onOuterAbort)
       state.activeTurnSessions.delete(String(sessionId))
+      // 资源面: turn 收敛——活动窗口回到 idle, 历史翻新(订阅 history/activity 的客户端各得一次更新)
+      state.hooks.notifySessionActivity(String(sessionId))
+      state.hooks.notifySessionHistory(String(sessionId))
     }
 
     // 结构化读输出
@@ -491,14 +574,18 @@ export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult>
           data?: unknown
         }
         if (ev.type === 'assistant/message') {
-          const d = ev.data as { message?: { content?: { type?: string; text?: string }[]; usage?: { inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown } } } | undefined
+          const d = ev.data as {
+            message?: { content?: { type?: string; text?: string }[]; usage?: { inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown } }
+            /** 0.1.7+ 的 usage 挂在事件载荷上(不再随 message); 两处都试 */
+            usage?: { inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown }
+          } | undefined
           const content = d?.message?.content
           if (content) {
             const texts = content.filter((c) => c.type === 'text' && c.text).map((c) => c.text)
             if (texts.length) result.assistantText += texts.join('\n') + '\n'
           }
-          // token 用量(机会式): 宿主 assistant/message 带 TokenUsage 形状的 usage 时聚合; 没有就省略字段
-          const u = d?.message?.usage
+          // token 用量(机会式): 0.1.7+ 在事件载荷, 更早宿主在 message.usage; 都没有就省略字段
+          const u = d?.usage ?? d?.message?.usage
           if (u && typeof u === 'object') {
             const inTok = Number(u.inputTokens)
             const outTok = Number(u.outputTokens)
@@ -531,7 +618,14 @@ export async function executeTask(opts: ExecuteTaskOptions): Promise<TaskResult>
             const bits = [`turn ${d?.turn ?? '?'} ended: ${r.kind}`]
             if (r.error) bits.push(`${r.error.code ?? 'ERROR'}: ${r.error.message ?? ''}`)
             else if (r.reason !== undefined) bits.push(String(r.reason))
-            result.error = (result.error ? `${result.error} | ` : '') + bits.join(' — ')
+            let msg = bits.join(' — ')
+            // blocked 收场通常是宿主在等交互式审批/输入: 无人值守的调用方拿不到它, 给出可执行的下一步
+            // (安排宿主侧审批/放宽审批策略后, 用同一 sessionId 续接继续)
+            if (r.kind === 'blocked') {
+              msg += ' (host is waiting for interactive input/approval that an unattended run cannot grant; '
+                + 'arrange approval or relax the host approval policy, then continue via agent_run with this sessionId)'
+            }
+            result.error = (result.error ? `${result.error} | ` : '') + msg
           }
         }
       }
@@ -593,4 +687,6 @@ export function rekeyPooledSession(sessionId: string, next: ModelSelection): voi
   rec.selection = next
   state.liveAgents.set(nextKey, rec)
   state.sessionToPoolKey.set(sessionId, nextKey)
+  // 池明细(dsh://agents)与会话模型字段变化 → 粗粒度清单广播(hub 侧合并)
+  state.hooks.notifyListChanged()
 }

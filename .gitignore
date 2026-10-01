@@ -1,10 +1,10 @@
 node_modules/
+lib/
 *.tsbuildinfo
 .npm-tmp/
 commit-msg.txt
 *.tgz
 smoke-run.log
-.smoke-queue*.json
 
 # ==== agent-gitignore (https://github.com/Leawind/agent-gitignore) ====
 # ============================================================================
