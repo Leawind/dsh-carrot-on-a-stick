@@ -1,9 +1,7 @@
 name: CI
 
+# Action 资源有限: 普通 push / PR 不自动跑, 只在手动触发时执行
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
